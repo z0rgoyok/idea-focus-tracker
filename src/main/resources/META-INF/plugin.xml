@@ -1,0 +1,67 @@
+<idea-plugin>
+    <id>com.focustracker.idea-focus-tracker</id>
+    <name>Focus Time Tracker</name>
+    <version>1.0.0</version>
+    <vendor email="support@example.com" url="https://github.com/example/idea-focus-tracker">
+        Focus Tracker
+    </vendor>
+
+    <description><![CDATA[
+        <h2>Focus Time Tracker for IntelliJ IDEA</h2>
+        <p>Track how much time you spend focused in IntelliJ IDEA with detailed statistics and visualizations.</p>
+
+        <h3>Features:</h3>
+        <ul>
+            <li><b>Automatic tracking</b> - Tracks when IntelliJ window is in focus</li>
+            <li><b>Daily statistics</b> - See your focus time for today</li>
+            <li><b>Session tracking</b> - Track current coding session duration</li>
+            <li><b>Weekly chart</b> - Visual bar chart of last 7 days</li>
+            <li><b>Monthly heatmap</b> - GitHub-style activity visualization for 30 days</li>
+            <li><b>Status bar widget</b> - Quick glance at today's focus time</li>
+            <li><b>Persistent storage</b> - Data saved between sessions</li>
+        </ul>
+
+        <h3>Usage:</h3>
+        <p>Open the "Focus Tracker" tool window from View → Tool Windows → Focus Tracker,
+        or click the timer in the status bar.</p>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>1.0.0</h3>
+        <ul>
+            <li>Initial release</li>
+            <li>Focus time tracking</li>
+            <li>Dashboard with weekly and monthly charts</li>
+            <li>Status bar widget</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Application-level service for focus tracking -->
+        <applicationService
+            serviceImplementation="com.focustracker.services.FocusTrackingService"/>
+
+        <!-- Persistent state for storing focus time data -->
+        <applicationService
+            serviceImplementation="com.focustracker.state.FocusTimeState"/>
+
+        <!-- Startup activity to begin tracking -->
+        <postStartupActivity
+            implementation="com.focustracker.services.FocusTrackerStartupActivity"/>
+
+        <!-- Tool window for dashboard -->
+        <toolWindow
+            id="Focus Tracker"
+            anchor="right"
+            icon="AllIcons.Actions.ProfileCPU"
+            factoryClass="com.focustracker.ui.FocusTimeToolWindowFactory"/>
+
+        <!-- Status bar widget -->
+        <statusBarWidgetFactory
+            id="FocusTimeWidget"
+            implementation="com.focustracker.ui.FocusTimeStatusBarWidgetFactory"
+            order="after positionWidget"/>
+    </extensions>
+</idea-plugin>
