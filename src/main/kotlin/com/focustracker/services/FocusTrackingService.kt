@@ -33,6 +33,9 @@ class FocusTrackingService : Disposable {
     }
     private var periodicTask: ScheduledFuture<*>? = null
     private var focusCheckTask: ScheduledFuture<*>? = null
+    private var focusLossGraceStopTask: ScheduledFuture<*>? = null
+
+    private val focusLossGraceMillis = TimeUnit.MINUTES.toMillis(2)
 
     private val focusPropertyListener = PropertyChangeListener { evt ->
         if (evt.propertyName == "focusedWindow") {
@@ -103,6 +106,12 @@ class FocusTrackingService : Disposable {
                 className.contains("idea", ignoreCase = true) ||
                 className.contains("jetbrains", ignoreCase = true)
         } == true
+
+        if (isIdea && focusLossGraceStopTask != null) {
+            focusLossGraceStopTask?.cancel(false)
+            focusLossGraceStopTask = null
+            notifyListeners()
+        }
 
         if (isIdea && !isIdeaFocused) {
             onFocusGained(matchedProject)
@@ -202,13 +211,28 @@ class FocusTrackingService : Disposable {
     }
 
     private fun onFocusLost() {
-        log.info("IDEA window lost focus")
-        isIdeaFocused = false
-        saveFocusTime()
-        val state = FocusTimeState.getInstance()
-        synchronized(state) {
-            state.focusSessionStartTime = null
-        }
+        if (focusLossGraceStopTask != null) return
+
+        log.info("IDEA window lost focus (starting 2-minute grace period)")
+
+        focusLossGraceStopTask = scheduler.schedule({
+            try {
+                log.info("Grace period elapsed, stopping tracking")
+                isIdeaFocused = false
+                saveFocusTime()
+
+                val state = FocusTimeState.getInstance()
+                synchronized(state) {
+                    state.focusSessionStartTime = null
+                }
+
+                focusLossGraceStopTask = null
+                notifyListeners()
+            } catch (e: Exception) {
+                log.error("Error stopping tracking after grace period", e)
+            }
+        }, focusLossGraceMillis, TimeUnit.MILLISECONDS)
+
         notifyListeners()
     }
 
@@ -379,6 +403,7 @@ class FocusTrackingService : Disposable {
         // Shutdown scheduler
         periodicTask?.cancel(false)
         focusCheckTask?.cancel(false)
+        focusLossGraceStopTask?.cancel(false)
         scheduler.shutdown()
         try {
             scheduler.awaitTermination(5, TimeUnit.SECONDS)
