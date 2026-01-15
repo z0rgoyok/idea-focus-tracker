@@ -34,9 +34,15 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
     private val periodComboBox = com.intellij.openapi.ui.ComboBox(periodOptions)
     private var selectedPeriodDays = 7
 
+    private val historyFilterOptions = arrayOf("All", "Mine", "AI")
+    private val historyFilterComboBox = com.intellij.openapi.ui.ComboBox(historyFilterOptions)
+    private var selectedHistoryFilter = HistoryFilter.ALL
+
     private val periodChartPanel = PeriodChartPanel()
     private val projectsTableModel = ProjectsTableModel()
     private val projectsTable = JBTable(projectsTableModel)
+    private val aiProjectsTableModel = ProjectsTableModel()
+    private val aiProjectsTable = JBTable(aiProjectsTableModel)
 
     private val updateListener: () -> Unit = { refreshData() }
 
@@ -48,6 +54,13 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         periodComboBox.selectedIndex = 1 // Default to 7 days
         periodComboBox.addActionListener {
             selectedPeriodDays = periodDays[periodComboBox.selectedIndex]
+            refreshData()
+        }
+
+        // Setup history filter
+        historyFilterComboBox.selectedIndex = 0 // Default to All
+        historyFilterComboBox.addActionListener {
+            selectedHistoryFilter = HistoryFilter.entries[historyFilterComboBox.selectedIndex]
             refreshData()
         }
 
@@ -67,7 +80,11 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         // Projects section
         contentPanel.add(createSectionLabel("Projects"))
         contentPanel.add(Box.createVerticalStrut(8))
-        contentPanel.add(createProjectsPanel())
+        contentPanel.add(createProjectsPanel(projectsTable))
+        contentPanel.add(Box.createVerticalStrut(16))
+        contentPanel.add(createSectionLabel("AI"))
+        contentPanel.add(Box.createVerticalStrut(8))
+        contentPanel.add(createProjectsPanel(aiProjectsTable))
         contentPanel.add(Box.createVerticalStrut(24))
 
         // Period chart with selector
@@ -148,17 +165,28 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                 foreground = JBColor.foreground()
             }
 
+            val controlsPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 8, 0)).apply {
+                isOpaque = false
+            }
+
+            historyFilterComboBox.apply {
+                preferredSize = Dimension(90, 28)
+            }
+
             periodComboBox.apply {
                 preferredSize = Dimension(100, 28)
             }
 
             add(label, BorderLayout.WEST)
-            add(periodComboBox, BorderLayout.EAST)
+
+            controlsPanel.add(historyFilterComboBox)
+            controlsPanel.add(periodComboBox)
+            add(controlsPanel, BorderLayout.EAST)
         }
     }
 
-    private fun createProjectsPanel(): JPanel {
-        projectsTable.apply {
+    private fun createProjectsPanel(table: JBTable): JPanel {
+        table.apply {
             setShowGrid(false)
             intercellSpacing = Dimension(0, 0)
             rowHeight = 28
@@ -191,7 +219,7 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             maximumSize = Dimension(Int.MAX_VALUE, 200)
             preferredSize = Dimension(400, 150)
 
-            val scrollPane = JBScrollPane(projectsTable).apply {
+            val scrollPane = JBScrollPane(table).apply {
                 border = BorderFactory.createLineBorder(JBColor.border(), 1)
             }
             add(scrollPane, BorderLayout.CENTER)
@@ -234,6 +262,7 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
     private fun refreshData() {
         val state = FocusTimeState.getInstance()
         val service = FocusTrackingService.getInstance()
+        val knownProjects = service.getOpenProjectsInfo()
 
         // Update status
         val isPaused = service.isPaused()
@@ -263,19 +292,38 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         pauseButton.toolTipText = if (isPaused) "Resume tracking" else "Pause tracking"
 
         // Get period data
-        val periodData = state.getPeriodFocusTime(selectedPeriodDays)
+        val focusPeriodData = state.getPeriodFocusTime(selectedPeriodDays)
+        val aiPeriodData = state.getAiPeriodTime(selectedPeriodDays)
+
+        val periodData = when (selectedHistoryFilter) {
+            HistoryFilter.ALL -> focusPeriodData.mapValues { (k, v) -> v + (aiPeriodData[k] ?: 0L) }
+            HistoryFilter.MINE -> focusPeriodData
+            HistoryFilter.AI -> aiPeriodData
+        }
+
+        val todayMillis = when (selectedHistoryFilter) {
+            HistoryFilter.ALL -> state.getTodayFocusTime() + state.getAiTodayTime()
+            HistoryFilter.MINE -> state.getTodayFocusTime()
+            HistoryFilter.AI -> state.getAiTodayTime()
+        }
+
+        val periodMillis = periodData.values.sum()
+
+        val allTimeMillis = when (selectedHistoryFilter) {
+            HistoryFilter.ALL -> state.getTotalFocusTime() + state.getAiTotalTime()
+            HistoryFilter.MINE -> state.getTotalFocusTime()
+            HistoryFilter.AI -> state.getAiTotalTime()
+        }
 
         // Update stats
-        todayTimeLabel.text = formatDuration(state.getTodayFocusTime())
+        todayTimeLabel.text = formatDuration(todayMillis)
         sessionTimeLabel.text = formatDuration(service.getCurrentSessionTime())
-        periodTotalLabel.text = formatDuration(periodData.values.sum())
-        allTimeTotalLabel.text = formatDuration(state.getTotalFocusTime())
+        periodTotalLabel.text = formatDuration(periodMillis)
+        allTimeTotalLabel.text = formatDuration(allTimeMillis)
 
         // Update projects table
-        projectsTableModel.updateData(
-            state.getAllProjectsStats(service.getOpenProjectsInfo()),
-            service.getActiveProjectId()
-        )
+        projectsTableModel.updateData(state.getAllProjectsStats(knownProjects), service.getActiveProjectId())
+        aiProjectsTableModel.updateData(state.getAiProjectsStats(knownProjects), service.getActiveProjectId())
 
         // Update chart
         periodChartPanel.updateData(periodData, selectedPeriodDays)
@@ -296,6 +344,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
 
     override fun dispose() {
         // Cleanup handled by Disposer
+    }
+
+    private enum class HistoryFilter {
+        ALL,
+        MINE,
+        AI
     }
 }
 

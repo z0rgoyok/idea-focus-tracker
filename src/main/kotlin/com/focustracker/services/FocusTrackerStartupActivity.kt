@@ -8,5 +8,6 @@ class FocusTrackerStartupActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
         // Start tracking when first project opens
         FocusTrackingService.getInstance().startTracking()
+        TerminalAiTrackingService.getInstance().startTracking(project)
     }
 }

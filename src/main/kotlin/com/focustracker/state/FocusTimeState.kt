@@ -23,6 +23,15 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
     // Map of project id to (date -> milliseconds)
     var projectFocusTime: MutableMap<String, MutableMap<String, Long>> = mutableMapOf()
 
+    // AI/Terminal activity: total across all projects (date -> milliseconds)
+    var aiDailyTime: MutableMap<String, Long> = mutableMapOf()
+
+    // AI/Terminal activity: project id -> (date -> milliseconds)
+    var aiProjectTime: MutableMap<String, MutableMap<String, Long>> = mutableMapOf()
+
+    // AI/Terminal "active" segments per project (start -> end), where end = lastActivity + idleThreshold
+    var aiActiveSegments: MutableMap<String, AiSegment> = mutableMapOf()
+
     // Tracking checkpoint start time (millis since epoch), null if not focused or paused
     var sessionStartTime: Long? = null
 
@@ -46,6 +55,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
     override fun loadState(state: FocusTimeState) {
         XmlSerializerUtil.copyBean(state, this)
         migrateLegacyProjectKeys()
+        flushExpiredAiSegments(System.currentTimeMillis())
     }
 
     fun getTodayKey(): String = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
@@ -72,7 +82,8 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         }
 
         val legacyKeys = projectFocusTime.keys.filter { !isProjectId(it) }
-        if (legacyKeys.isEmpty()) return
+        val legacyAiKeys = aiProjectTime.keys.filter { !isProjectId(it) }
+        if (legacyKeys.isEmpty() && legacyAiKeys.isEmpty()) return
 
         for (legacyKey in legacyKeys) {
             val migratedKey = PROJECT_ID_NAME_PREFIX + legacyKey
@@ -86,8 +97,20 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             projectDisplayNames.putIfAbsent(migratedKey, legacyKey)
         }
 
+        for (legacyKey in legacyAiKeys) {
+            val migratedKey = PROJECT_ID_NAME_PREFIX + legacyKey
+            val legacyData = aiProjectTime.remove(legacyKey) ?: continue
+
+            val target = aiProjectTime.getOrPut(migratedKey) { mutableMapOf() }
+            for ((date, millis) in legacyData) {
+                target[date] = (target[date] ?: 0L) + millis
+            }
+
+            projectDisplayNames.putIfAbsent(migratedKey, legacyKey)
+        }
+
         // Fill display names for already-migrated ids when missing.
-        for (projectId in projectFocusTime.keys) {
+        for (projectId in projectFocusTime.keys + aiProjectTime.keys) {
             if (!projectDisplayNames.containsKey(projectId)) {
                 projectDisplayNames[projectId] = getProjectDisplayName(projectId)
             }
@@ -99,6 +122,103 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             val today = getTodayKey()
             val stored = dailyFocusTime[today] ?: 0L
             stored + getActiveTrackingOverlapForDay(today)
+        }
+    }
+
+    fun recordAiActivity(projectId: String, projectName: String? = null, nowMillis: Long = System.currentTimeMillis()) {
+        synchronized(this) {
+            projectName?.let { projectDisplayNames[projectId] = it }
+
+            val segment = aiActiveSegments[projectId]
+            val newEnd = nowMillis + AI_IDLE_THRESHOLD_MILLIS
+
+            if (segment == null) {
+                aiActiveSegments[projectId] = AiSegment(startMillis = nowMillis, endMillis = newEnd)
+                return
+            }
+
+            if (nowMillis <= segment.endMillis) {
+                segment.endMillis = maxOf(segment.endMillis, newEnd)
+                return
+            }
+
+            // Previous segment ended; persist it and start a new one.
+            persistAiInterval(projectId, segment.startMillis, segment.endMillis)
+            segment.startMillis = nowMillis
+            segment.endMillis = newEnd
+        }
+    }
+
+    fun flushExpiredAiSegments(nowMillis: Long = System.currentTimeMillis()) {
+        synchronized(this) {
+            val it = aiActiveSegments.entries.iterator()
+            while (it.hasNext()) {
+                val (projectId, segment) = it.next()
+                if (segment.endMillis <= nowMillis) {
+                    persistAiInterval(projectId, segment.startMillis, segment.endMillis)
+                    it.remove()
+                }
+            }
+        }
+    }
+
+    fun endAiSegmentsAt(cutoffMillis: Long) {
+        synchronized(this) {
+            val it = aiActiveSegments.entries.iterator()
+            while (it.hasNext()) {
+                val (projectId, segment) = it.next()
+                val end = minOf(segment.endMillis, cutoffMillis)
+                persistAiInterval(projectId, segment.startMillis, end)
+                it.remove()
+            }
+        }
+    }
+
+    fun getAiTodayTime(): Long {
+        return synchronized(this) {
+            val todayKey = getTodayKey()
+            val stored = aiDailyTime[todayKey] ?: 0L
+            stored + getAiActiveOverlapForDay(todayKey)
+        }
+    }
+
+    fun getAiTotalTime(): Long {
+        return synchronized(this) {
+            var total = aiDailyTime.values.sum()
+            val now = System.currentTimeMillis()
+            for (segment in aiActiveSegments.values) {
+                val end = minOf(now, segment.endMillis)
+                total += (end - segment.startMillis).coerceAtLeast(0L)
+            }
+            total
+        }
+    }
+
+    fun getAiPeriodTime(days: Int): Map<String, Long> {
+        return synchronized(this) {
+            val result = mutableMapOf<String, Long>()
+            val today = LocalDate.now()
+
+            for (i in (days - 1) downTo 0) {
+                val date = today.minusDays(i.toLong())
+                val key = date.format(DateTimeFormatter.ISO_LOCAL_DATE)
+                result[key] = aiDailyTime[key] ?: 0L
+            }
+
+            val now = System.currentTimeMillis()
+            for ((_, segment) in aiActiveSegments) {
+                val start = segment.startMillis
+                val end = minOf(now, segment.endMillis)
+                if (end <= start) continue
+                for (key in result.keys) {
+                    val overlap = overlapMillisWithDay(start, end, key)
+                    if (overlap > 0L) {
+                        result[key] = (result[key] ?: 0L) + overlap
+                    }
+                }
+            }
+
+            result
         }
     }
 
@@ -228,24 +348,101 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         }
     }
 
+    fun getAiProjectsStats(knownProjects: List<ProjectInfo>): List<ProjectStatsRow> {
+        return synchronized(this) {
+            migrateLegacyProjectKeys()
+            migrateNameIdsToLocationIds(knownProjects)
+
+            // Keep display names up to date for known projects.
+            for (p in knownProjects) {
+                projectDisplayNames[p.id] = p.name
+            }
+
+            val today = getTodayKey()
+            val now = System.currentTimeMillis()
+
+            val ids = LinkedHashSet<String>()
+            ids.addAll(knownProjects.map { it.id })
+            ids.addAll(aiProjectTime.keys)
+            ids.addAll(aiActiveSegments.keys)
+
+            ids.map { projectId ->
+                val dateMap = aiProjectTime[projectId] ?: emptyMap()
+                val storedToday = dateMap[today] ?: 0L
+                val storedTotal = dateMap.values.sum()
+
+                val segment = aiActiveSegments[projectId]
+                val activeEnd = segment?.let { minOf(now, it.endMillis) } ?: 0L
+                val activeToday = if (segment != null) overlapMillisWithDay(segment.startMillis, activeEnd, today) else 0L
+                val activeTotal = if (segment != null) (activeEnd - segment.startMillis).coerceAtLeast(0L) else 0L
+
+                ProjectStatsRow(
+                    id = projectId,
+                    name = getProjectDisplayName(projectId),
+                    todayTime = storedToday + activeToday,
+                    totalTime = storedTotal + activeTotal
+                )
+            }
+        }
+    }
+
     private fun migrateNameIdsToLocationIds(knownProjects: List<ProjectInfo>) {
         for (p in knownProjects) {
             if (!p.id.startsWith(PROJECT_ID_LOCATION_PREFIX)) continue
 
             val legacyKey = PROJECT_ID_NAME_PREFIX + p.name
-            val legacyData = projectFocusTime[legacyKey] ?: continue
 
-            val target = projectFocusTime.getOrPut(p.id) { mutableMapOf() }
-            for ((date, millis) in legacyData) {
-                target[date] = (target[date] ?: 0L) + millis
+            projectFocusTime[legacyKey]?.let { legacyData ->
+                val target = projectFocusTime.getOrPut(p.id) { mutableMapOf() }
+                for ((date, millis) in legacyData) {
+                    target[date] = (target[date] ?: 0L) + millis
+                }
+                projectFocusTime.remove(legacyKey)
+                if (activeProject == legacyKey) {
+                    activeProject = p.id
+                }
             }
 
-            projectFocusTime.remove(legacyKey)
+            aiProjectTime[legacyKey]?.let { legacyData ->
+                val target = aiProjectTime.getOrPut(p.id) { mutableMapOf() }
+                for ((date, millis) in legacyData) {
+                    target[date] = (target[date] ?: 0L) + millis
+                }
+                aiProjectTime.remove(legacyKey)
+            }
+
             projectDisplayNames[p.id] = p.name
+        }
+    }
 
-            if (activeProject == legacyKey) {
-                activeProject = p.id
-            }
+    private fun getAiActiveOverlapForDay(dayKey: String): Long {
+        val now = System.currentTimeMillis()
+        var total = 0L
+        for (segment in aiActiveSegments.values) {
+            val end = minOf(now, segment.endMillis)
+            total += overlapMillisWithDay(segment.startMillis, end, dayKey)
+        }
+        return total
+    }
+
+    private fun persistAiInterval(projectId: String, startMillis: Long, endMillis: Long) {
+        if (endMillis <= startMillis) return
+        val zone = ZoneId.systemDefault()
+
+        var cursor = startMillis
+        var date = java.time.Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()
+        while (cursor < endMillis) {
+            val nextMidnight = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+            val segmentEnd = minOf(endMillis, nextMidnight)
+            val elapsed = (segmentEnd - cursor).coerceAtLeast(0L)
+            val dateKey = date.format(DateTimeFormatter.ISO_LOCAL_DATE)
+
+            aiDailyTime[dateKey] = (aiDailyTime[dateKey] ?: 0L) + elapsed
+            val projectData = aiProjectTime.getOrPut(projectId) { mutableMapOf() }
+            projectData[dateKey] = (projectData[dateKey] ?: 0L) + elapsed
+
+            cursor = segmentEnd
+            date = date.plusDays(1)
         }
     }
 
@@ -289,8 +486,14 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         private const val PROJECT_ID_NAME_PREFIX = "name:"
         private const val PROJECT_ID_LOCATION_PREFIX = "loc:"
         private const val UNASSIGNED_PROJECT_ID = "__unassigned__"
+        private const val AI_IDLE_THRESHOLD_MILLIS = 10 * 1000L
 
         fun getInstance(): FocusTimeState =
             ApplicationManager.getApplication().getService(FocusTimeState::class.java)
     }
+
+    data class AiSegment(
+        var startMillis: Long,
+        var endMillis: Long
+    )
 }

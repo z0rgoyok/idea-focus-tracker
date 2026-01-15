@@ -33,6 +33,8 @@ class FocusTrackingService : Disposable {
     }
     private var periodicTask: ScheduledFuture<*>? = null
     private var focusCheckTask: ScheduledFuture<*>? = null
+    @Volatile
+    private var lastHeartbeatAt: Long = 0L
     private var focusLossGraceStopTask: ScheduledFuture<*>? = null
 
     private val focusLossGraceMillis = TimeUnit.MINUTES.toMillis(2)
@@ -77,6 +79,7 @@ class FocusTrackingService : Disposable {
         // Periodic save every 5 seconds
         periodicTask = scheduler.scheduleAtFixedRate({
             try {
+                handlePossibleSystemSuspend()
                 saveFocusTime()
                 checkDateChange()
                 notifyListeners()
@@ -88,11 +91,36 @@ class FocusTrackingService : Disposable {
         // More frequent UI update every 1 second
         focusCheckTask = scheduler.scheduleAtFixedRate({
             try {
+                handlePossibleSystemSuspend()
                 notifyListeners()
             } catch (e: Exception) {
                 log.error("Error in UI update", e)
             }
         }, 1, 1, TimeUnit.SECONDS)
+    }
+
+    private fun handlePossibleSystemSuspend() {
+        val now = System.currentTimeMillis()
+        val last = lastHeartbeatAt
+        lastHeartbeatAt = now
+
+        if (last == 0L) return
+        if (now - last <= SYSTEM_SUSPEND_GAP_THRESHOLD_MILLIS) return
+
+        // Scheduler was paused (e.g., machine sleep). Prevent counting the whole gap as focus time.
+        val state = FocusTimeState.getInstance()
+        synchronized(state) {
+            if (state.isPaused) return
+
+            if (isIdeaFocused) {
+                state.sessionStartTime = now
+                state.focusSessionStartTime = now
+                state.sessionDate = state.getTodayKey()
+            } else {
+                state.sessionStartTime = null
+                state.focusSessionStartTime = null
+            }
+        }
     }
 
     private fun handleFocusChange(window: Window?) {
@@ -415,6 +443,8 @@ class FocusTrackingService : Disposable {
     }
 
     companion object {
+        private const val SYSTEM_SUSPEND_GAP_THRESHOLD_MILLIS = 30_000L
+
         fun getInstance(): FocusTrackingService =
             ApplicationManager.getApplication().getService(FocusTrackingService::class.java)
     }
