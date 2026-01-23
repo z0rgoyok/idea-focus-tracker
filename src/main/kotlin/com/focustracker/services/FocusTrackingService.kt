@@ -10,13 +10,19 @@ import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.wm.IdeFocusManager
 import com.intellij.openapi.wm.IdeFrame
 import com.intellij.openapi.wm.WindowManager
+import java.awt.AWTEvent
 import java.awt.KeyboardFocusManager
+import java.awt.Toolkit
 import java.awt.Window
+import java.awt.event.KeyEvent
+import java.awt.event.MouseEvent
+import java.awt.event.MouseWheelEvent
 import java.beans.PropertyChangeListener
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.LinkedHashSet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -36,8 +42,47 @@ class FocusTrackingService : Disposable {
     @Volatile
     private var lastHeartbeatAt: Long = 0L
     private var focusLossGraceStopTask: ScheduledFuture<*>? = null
+    private var focusGainStartTask: ScheduledFuture<*>? = null
 
     private val focusLossGraceMillis = TimeUnit.MINUTES.toMillis(2)
+
+    @Volatile
+    private var lastUserActivityAt: Long = System.currentTimeMillis()
+
+    @Volatile
+    private var isIdlePaused: Boolean = false
+
+    @Volatile
+    private var lastIdeaWindow: Window? = null
+
+    private val awtActivityListener = java.awt.event.AWTEventListener { event ->
+        try {
+            if (!isIdeaWindowFocused) return@AWTEventListener
+
+            when (event) {
+                is MouseEvent -> {
+                    // Ignore pure enter/exit noise; count real interactions/movement.
+                    if (event.id == MouseEvent.MOUSE_ENTERED || event.id == MouseEvent.MOUSE_EXITED) return@AWTEventListener
+                }
+
+                is MouseWheelEvent -> Unit
+
+                is KeyEvent -> {
+                    if (event.id != KeyEvent.KEY_PRESSED) return@AWTEventListener
+                }
+
+                else -> return@AWTEventListener
+            }
+
+            lastUserActivityAt = System.currentTimeMillis()
+
+            if (isIdlePaused && !FocusTimeState.getInstance().isPaused) {
+                resumeFromIdle()
+            }
+        } catch (_: Throwable) {
+            // ignore
+        }
+    }
 
     private val focusPropertyListener = PropertyChangeListener { evt ->
         if (evt.propertyName == "focusedWindow") {
@@ -49,7 +94,13 @@ class FocusTrackingService : Disposable {
     private var isIdeaFocused = false
 
     @Volatile
+    private var isIdeaWindowFocused = false
+
+    @Volatile
     private var isStarted = false
+
+    @Volatile
+    private var recentProjectsBackfilled = false
 
     private fun getProjectId(project: Project): String {
         val locationHash = project.locationHash
@@ -66,6 +117,21 @@ class FocusTrackingService : Disposable {
 
         log.info("Starting focus tracking service")
 
+        // Best-effort backfill for older state entries that may not have stored paths yet.
+        scheduler.execute { backfillProjectPathsFromRecentProjects() }
+
+        try {
+            Toolkit.getDefaultToolkit().addAWTEventListener(
+                awtActivityListener,
+                AWTEvent.MOUSE_EVENT_MASK or
+                    AWTEvent.MOUSE_MOTION_EVENT_MASK or
+                    AWTEvent.MOUSE_WHEEL_EVENT_MASK or
+                    AWTEvent.KEY_EVENT_MASK
+            )
+        } catch (e: Throwable) {
+            log.debug("Unable to register AWT activity listener", e)
+        }
+
         // Add global focus listener
         KeyboardFocusManager.getCurrentKeyboardFocusManager()
             .addPropertyChangeListener("focusedWindow", focusPropertyListener)
@@ -80,6 +146,7 @@ class FocusTrackingService : Disposable {
         periodicTask = scheduler.scheduleAtFixedRate({
             try {
                 handlePossibleSystemSuspend()
+                handleUserIdle()
                 saveFocusTime()
                 checkDateChange()
                 notifyListeners()
@@ -92,6 +159,7 @@ class FocusTrackingService : Disposable {
         focusCheckTask = scheduler.scheduleAtFixedRate({
             try {
                 handlePossibleSystemSuspend()
+                handleUserIdle()
                 notifyListeners()
             } catch (e: Exception) {
                 log.error("Error in UI update", e)
@@ -112,6 +180,9 @@ class FocusTrackingService : Disposable {
         synchronized(state) {
             if (state.isPaused) return
 
+            // Reset idle state; we'll re-establish activity on next input.
+            isIdlePaused = false
+
             if (isIdeaFocused) {
                 state.sessionStartTime = now
                 state.focusSessionStartTime = now
@@ -123,17 +194,40 @@ class FocusTrackingService : Disposable {
         }
     }
 
+    private fun handleUserIdle() {
+        if (!isIdeaFocused) return
+        if (!isIdeaWindowFocused) return
+
+        val state = FocusTimeState.getInstance()
+        if (state.isPaused) return
+
+        val now = System.currentTimeMillis()
+        val idleFor = now - lastUserActivityAt
+        if (idleFor <= USER_IDLE_THRESHOLD_MILLIS) return
+
+        val cutoff = lastUserActivityAt + USER_IDLE_THRESHOLD_MILLIS
+        pauseForIdle(cutoff)
+    }
+
     private fun handleFocusChange(window: Window?) {
         val projectFrames = WindowManager.getInstance().allProjectFrames
 
         val matchedProject = resolveProjectForWindow(window, projectFrames)
+        val activeFrameProject = resolveActiveProjectFromFrames(projectFrames)
 
         // Also check for dialogs and other IDEA windows
-        val isIdea = matchedProject != null || window?.javaClass?.name?.let { className ->
+        val isIdea = matchedProject != null || activeFrameProject != null || window?.javaClass?.name?.let { className ->
             className.contains("intellij", ignoreCase = true) ||
                 className.contains("idea", ignoreCase = true) ||
                 className.contains("jetbrains", ignoreCase = true)
         } == true
+
+        val effectiveProject = matchedProject ?: activeFrameProject
+
+        isIdeaWindowFocused = isIdea
+        if (isIdea) {
+            lastIdeaWindow = window ?: findActiveFrameWindow(projectFrames)
+        }
 
         if (isIdea && focusLossGraceStopTask != null) {
             focusLossGraceStopTask?.cancel(false)
@@ -141,14 +235,168 @@ class FocusTrackingService : Disposable {
             notifyListeners()
         }
 
-        if (isIdea && !isIdeaFocused) {
-            onFocusGained(matchedProject)
-        } else if (isIdea && isIdeaFocused && matchedProject != null) {
-            // Project changed while focused
-            onProjectChanged(matchedProject)
-        } else if (!isIdea && isIdeaFocused) {
+        if (isIdea) {
+            if (!isIdeaFocused && focusGainStartTask == null) {
+                scheduleFocusGained(effectiveProject)
+            } else if (!isIdeaFocused && focusGainStartTask != null) {
+                // Still waiting for delayed start; update pending project association if possible.
+                updatePendingProject(effectiveProject)
+            } else if (isIdeaFocused && effectiveProject != null) {
+                // Project changed while focused
+                lastUserActivityAt = System.currentTimeMillis()
+                onProjectChanged(effectiveProject)
+            }
+            return
+        }
+
+        // Not an IDEA window.
+        if (focusGainStartTask != null) {
+            focusGainStartTask?.cancel(false)
+            focusGainStartTask = null
+            pendingFocusProjectId = null
+            pendingFocusProjectName = null
+            notifyListeners()
+        }
+
+        if (isIdeaFocused) {
             onFocusLost()
         }
+    }
+
+    @Volatile
+    private var pendingFocusProjectId: String? = null
+
+    @Volatile
+    private var pendingFocusProjectName: String? = null
+
+    private fun updatePendingProject(project: Project?) {
+        if (project == null || project.isDisposed) return
+        val projectId = getProjectId(project)
+        pendingFocusProjectId = projectId
+        pendingFocusProjectName = project.name
+        val state = FocusTimeState.getInstance()
+        synchronized(state) {
+            state.projectDisplayNames[projectId] = project.name
+        }
+    }
+
+    private fun scheduleFocusGained(project: Project?) {
+        updatePendingProject(project)
+
+        log.info("IDEA window gained focus (starting ${FOCUS_GAIN_DELAY_MILLIS}ms delay), project: ${project?.name}")
+
+        focusGainStartTask?.cancel(false)
+        focusGainStartTask = scheduler.schedule(
+            Runnable {
+                try {
+                    if (!isIdeaWindowFocused) {
+                        focusGainStartTask = null
+                        pendingFocusProjectId = null
+                        pendingFocusProjectName = null
+                        notifyListeners()
+                        return@Runnable
+                    }
+                    startTrackingAfterDelay()
+                } catch (e: Exception) {
+                    log.error("Error starting tracking after focus delay", e)
+                }
+            },
+            FOCUS_GAIN_DELAY_MILLIS,
+            TimeUnit.MILLISECONDS
+        )
+
+        notifyListeners()
+    }
+
+    private fun startTrackingAfterDelay() {
+        val state = FocusTimeState.getInstance()
+
+        // Don't start tracking if paused
+        if (state.isPaused) {
+            log.info("Focus delay elapsed but tracking is paused")
+            focusGainStartTask = null
+            notifyListeners()
+            return
+        }
+
+        isIdeaFocused = true
+        isIdlePaused = false
+        focusGainStartTask = null
+        lastUserActivityAt = System.currentTimeMillis()
+
+        val now = System.currentTimeMillis()
+        val projectId = pendingFocusProjectId
+        val projectName = pendingFocusProjectName
+        pendingFocusProjectId = null
+        pendingFocusProjectName = null
+
+        synchronized(state) {
+            val todayKey = state.getTodayKey()
+            if (state.sessionDate != todayKey) {
+                state.sessionDate = todayKey
+            }
+
+            state.sessionStartTime = now
+            state.focusSessionStartTime = now
+            if (projectId != null) {
+                state.activeProject = projectId
+                if (projectName != null) {
+                    state.projectDisplayNames[projectId] = projectName
+                }
+            }
+        }
+
+        notifyListeners()
+    }
+
+    private fun pauseForIdle(cutoffMillis: Long) {
+        if (isIdlePaused) return
+        if (!isIdeaFocused) return
+
+        log.info("User idle detected, pausing tracking at $cutoffMillis")
+
+        // Persist time only up to the idle cutoff, then stop tracking.
+        saveFocusTime(nowMillis = cutoffMillis, continueTracking = false)
+
+        val state = FocusTimeState.getInstance()
+        synchronized(state) {
+            state.sessionStartTime = null
+            state.focusSessionStartTime = null
+        }
+
+        isIdlePaused = true
+        isIdeaFocused = false
+
+        notifyListeners()
+    }
+
+    private fun resumeFromIdle() {
+        if (!isIdlePaused) return
+        if (!isIdeaWindowFocused) return
+
+        val state = FocusTimeState.getInstance()
+        if (state.isPaused) return
+
+        val window = lastIdeaWindow ?: KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
+        val project = resolveProjectForWindow(window, WindowManager.getInstance().allProjectFrames)
+        updatePendingProject(project)
+
+        val now = System.currentTimeMillis()
+        synchronized(state) {
+            state.sessionStartTime = now
+            state.focusSessionStartTime = now
+            state.sessionDate = state.getTodayKey()
+            pendingFocusProjectId?.let { state.activeProject = it }
+        }
+
+        pendingFocusProjectId = null
+        pendingFocusProjectName = null
+
+        isIdlePaused = false
+        isIdeaFocused = true
+        lastUserActivityAt = now
+
+        notifyListeners()
     }
 
     private fun resolveProjectForWindow(window: Window?, projectFrames: Array<out IdeFrame>): Project? {
@@ -174,6 +422,23 @@ class FocusTrackingService : Disposable {
 
         val openProjects = ProjectManager.getInstance().openProjects.filter { !it.isDisposed }
         return openProjects.singleOrNull()
+    }
+
+    private fun findActiveFrameWindow(projectFrames: Array<out IdeFrame>): Window? {
+        for (frame in projectFrames) {
+            val frameWindow = frame.component?.let(SwingUtilities::getWindowAncestor) ?: continue
+            if (frameWindow.isActive) return frameWindow
+        }
+        return null
+    }
+
+    private fun resolveActiveProjectFromFrames(projectFrames: Array<out IdeFrame>): Project? {
+        for (frame in projectFrames) {
+            val project = frame.project ?: continue
+            val frameWindow = frame.component?.let(SwingUtilities::getWindowAncestor) ?: continue
+            if (frameWindow.isActive) return project
+        }
+        return null
     }
 
     private fun onFocusGained(project: Project?) {
@@ -247,6 +512,7 @@ class FocusTrackingService : Disposable {
             try {
                 log.info("Grace period elapsed, stopping tracking")
                 isIdeaFocused = false
+                isIdlePaused = false
                 saveFocusTime()
 
                 val state = FocusTimeState.getInstance()
@@ -270,17 +536,43 @@ class FocusTrackingService : Disposable {
         val wasPaused = synchronized(state) { state.isPaused }
 
         if (wasPaused) {
-            // Resume tracking
-            synchronized(state) {
-                state.isPaused = false
-                if (isIdeaFocused) {
-                    val now = System.currentTimeMillis()
-                    state.sessionStartTime = now
-                    state.focusSessionStartTime = now
-                    state.sessionDate = state.getTodayKey()
-                }
+            // Resume tracking (best-effort sync focus state; after sleep focus events may not fire).
+            synchronized(state) { state.isPaused = false }
+
+            isIdlePaused = false
+            lastUserActivityAt = System.currentTimeMillis()
+
+            val focusedWindow =
+                KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
+                    ?: IdeFocusManager.getGlobalInstance().lastFocusedFrame?.component?.let(SwingUtilities::getWindowAncestor)
+                    ?: lastIdeaWindow
+
+            val projectFrames = WindowManager.getInstance().allProjectFrames
+            val matchedProject = resolveProjectForWindow(focusedWindow, projectFrames)
+            val activeFrameProject = resolveActiveProjectFromFrames(projectFrames)
+            val effectiveProject = matchedProject ?: activeFrameProject
+
+            val isIdea = effectiveProject != null || focusedWindow?.javaClass?.name?.let { className ->
+                className.contains("intellij", ignoreCase = true) ||
+                    className.contains("idea", ignoreCase = true) ||
+                    className.contains("jetbrains", ignoreCase = true)
+            } == true
+
+            if (isIdea) {
+                isIdeaWindowFocused = true
+                lastIdeaWindow = focusedWindow ?: findActiveFrameWindow(projectFrames)
+
+                focusLossGraceStopTask?.cancel(false)
+                focusLossGraceStopTask = null
+                focusGainStartTask?.cancel(false)
+                focusGainStartTask = null
+
+                updatePendingProject(effectiveProject)
+                startTrackingAfterDelay()
+                log.info("Tracking resumed (in focus)")
+            } else {
+                log.info("Tracking resumed (not in focus)")
             }
-            log.info("Tracking resumed")
         } else {
             // Pause tracking - save current time first
             saveFocusTime()
@@ -298,8 +590,12 @@ class FocusTrackingService : Disposable {
     fun isPaused(): Boolean = FocusTimeState.getInstance().isPaused
 
     private fun saveFocusTime() {
+        saveFocusTime(nowMillis = System.currentTimeMillis(), continueTracking = isIdeaFocused)
+    }
+
+    private fun saveFocusTime(nowMillis: Long, continueTracking: Boolean) {
         val state = FocusTimeState.getInstance()
-        val now = System.currentTimeMillis()
+        val now = nowMillis
         val zone = ZoneId.systemDefault()
 
         synchronized(state) {
@@ -334,7 +630,7 @@ class FocusTrackingService : Disposable {
             state.sessionDate = LocalDate.now(zone).format(DateTimeFormatter.ISO_LOCAL_DATE)
 
             // Reset checkpoint start to now (continue tracking)
-            if (isIdeaFocused && !state.isPaused) {
+            if (continueTracking && !state.isPaused) {
                 state.sessionStartTime = now
             } else {
                 state.sessionStartTime = null
@@ -384,6 +680,97 @@ class FocusTrackingService : Disposable {
         }
     }
 
+    private fun backfillProjectPathsFromRecentProjects() {
+        if (recentProjectsBackfilled) return
+        recentProjectsBackfilled = true
+
+        val state = FocusTimeState.getInstance()
+        val missingIds = LinkedHashSet<String>()
+        synchronized(state) {
+            val candidates = LinkedHashSet<String>()
+            candidates.addAll(state.projectFocusTime.keys)
+            candidates.addAll(state.aiProjectTime.keys)
+            candidates.addAll(state.aiActiveSegments.keys)
+            state.activeProject?.let(candidates::add)
+
+            for (id in candidates) {
+                if (id.startsWith("loc:") && state.projectPaths[id].isNullOrBlank()) {
+                    missingIds.add(id)
+                }
+            }
+        }
+
+        if (missingIds.isEmpty()) return
+
+        val recentPaths: List<String> = try {
+            val clazz = Class.forName("com.intellij.ide.RecentProjectsManager")
+            val getInstance = clazz.methods.firstOrNull { it.name == "getInstance" && it.parameterCount == 0 } ?: return
+            val instance = getInstance.invoke(null) ?: return
+
+            val getRecentPaths = clazz.methods.firstOrNull { it.name == "getRecentPaths" && it.parameterCount == 0 }
+            val raw = getRecentPaths?.invoke(instance) ?: return
+
+            when (raw) {
+                is Collection<*> -> raw.filterIsInstance<String>()
+                is Array<*> -> raw.filterIsInstance<String>()
+                is Iterable<*> -> raw.filterIsInstance<String>()
+                else -> emptyList()
+            }
+        } catch (e: Throwable) {
+            log.debug("Unable to fetch recent project paths", e)
+            emptyList()
+        }
+
+        if (recentPaths.isEmpty()) return
+
+        val userHome = System.getProperty("user.home").orEmpty()
+
+        fun expandUserHomeMacros(path: String): String {
+            var result = path.trim()
+            if (userHome.isNotBlank()) {
+                result = result.replace("\$USER_HOME\$", userHome)
+                if (result.startsWith("~/")) {
+                    result = userHome.trimEnd('/') + "/" + result.removePrefix("~/")
+                }
+            }
+            return result
+        }
+
+        fun normalizedPathCandidates(path: String): List<String> {
+            val expanded = expandUserHomeMacros(path)
+            val withoutTrailingSlash = expanded.trimEnd('/')
+            return if (withoutTrailingSlash == expanded) listOf(expanded) else listOf(expanded, withoutTrailingSlash)
+        }
+
+        var updated = 0
+        synchronized(state) {
+            for (path in recentPaths) {
+                if (path.isBlank()) continue
+
+                for (candidate in normalizedPathCandidates(path)) {
+                    if (candidate.isBlank()) continue
+                    val projectId = "loc:" + Integer.toHexString(candidate.hashCode())
+                    if (!missingIds.contains(projectId)) continue
+                    state.projectPaths[projectId] = candidate
+                    updated++
+                    break
+                }
+            }
+        }
+
+        if (updated > 0) {
+            log.info("Backfilled project paths: $updated")
+            ApplicationManager.getApplication().invokeLater {
+                try {
+                    ApplicationManager.getApplication().saveSettings()
+                } catch (_: Throwable) {
+                    // ignore
+                }
+            }
+            notifyListeners()
+        }
+    }
+
     fun getCurrentSessionTime(): Long {
         val state = FocusTimeState.getInstance()
         if (state.isPaused || !isIdeaFocused) return 0L
@@ -405,8 +792,9 @@ class FocusTrackingService : Disposable {
             val state = FocusTimeState.getInstance()
             synchronized(state) {
                 state.projectDisplayNames[projectId] = p.name
+                p.basePath?.takeIf { it.isNotBlank() }?.let { state.projectPaths[projectId] = it }
             }
-            FocusTimeState.ProjectInfo(id = projectId, name = p.name)
+            FocusTimeState.ProjectInfo(id = projectId, name = p.name, path = p.basePath)
         }
     }
 
@@ -428,10 +816,17 @@ class FocusTrackingService : Disposable {
         KeyboardFocusManager.getCurrentKeyboardFocusManager()
             .removePropertyChangeListener("focusedWindow", focusPropertyListener)
 
+        try {
+            Toolkit.getDefaultToolkit().removeAWTEventListener(awtActivityListener)
+        } catch (_: Throwable) {
+            // ignore
+        }
+
         // Shutdown scheduler
         periodicTask?.cancel(false)
         focusCheckTask?.cancel(false)
         focusLossGraceStopTask?.cancel(false)
+        focusGainStartTask?.cancel(false)
         scheduler.shutdown()
         try {
             scheduler.awaitTermination(5, TimeUnit.SECONDS)
@@ -444,6 +839,8 @@ class FocusTrackingService : Disposable {
 
     companion object {
         private const val SYSTEM_SUSPEND_GAP_THRESHOLD_MILLIS = 30_000L
+        private const val FOCUS_GAIN_DELAY_MILLIS = 3_000L
+        private const val USER_IDLE_THRESHOLD_MILLIS = 60_000L
 
         fun getInstance(): FocusTrackingService =
             ApplicationManager.getApplication().getService(FocusTrackingService::class.java)

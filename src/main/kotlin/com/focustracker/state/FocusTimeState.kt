@@ -44,8 +44,14 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
     // Map of project id to display name (best-effort)
     var projectDisplayNames: MutableMap<String, String> = mutableMapOf()
 
+    // Map of project id to project path (best-effort, e.g. basePath)
+    var projectPaths: MutableMap<String, String> = mutableMapOf()
+
     // Manual pause state
     var isPaused: Boolean = false
+
+    // Feature flag: terminal AI activity tracking
+    var isAiTrackingEnabled: Boolean = false
 
     // Session start date for reset detection
     var sessionDate: String? = null
@@ -67,6 +73,10 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             projectId.startsWith(PROJECT_ID_LOCATION_PREFIX) -> projectId.removePrefix(PROJECT_ID_LOCATION_PREFIX)
             else -> projectId
         }
+    }
+
+    fun getProjectPath(projectId: String): String? {
+        return projectPaths[projectId]
     }
 
     private fun isProjectId(value: String): Boolean =
@@ -95,6 +105,10 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             }
 
             projectDisplayNames.putIfAbsent(migratedKey, legacyKey)
+            projectPaths[legacyKey]?.let { legacyPath ->
+                projectPaths.remove(legacyKey)
+                projectPaths.putIfAbsent(migratedKey, legacyPath)
+            }
         }
 
         for (legacyKey in legacyAiKeys) {
@@ -107,6 +121,10 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             }
 
             projectDisplayNames.putIfAbsent(migratedKey, legacyKey)
+            projectPaths[legacyKey]?.let { legacyPath ->
+                projectPaths.remove(legacyKey)
+                projectPaths.putIfAbsent(migratedKey, legacyPath)
+            }
         }
 
         // Fill display names for already-migrated ids when missing.
@@ -281,7 +299,8 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
 
     data class ProjectInfo(
         val id: String,
-        val name: String
+        val name: String,
+        val path: String? = null
     )
 
     fun getAllProjectsStats(knownProjects: List<ProjectInfo>): List<ProjectStatsRow> {
@@ -411,7 +430,152 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
                 aiProjectTime.remove(legacyKey)
             }
 
+            projectPaths[legacyKey]?.let { legacyPath ->
+                projectPaths.remove(legacyKey)
+                projectPaths[p.id] = legacyPath
+            }
+
             projectDisplayNames[p.id] = p.name
+        }
+    }
+
+    fun getTodayFocusTimeForProjects(projectIds: Set<String>): Long {
+        if (projectIds.isEmpty()) return 0L
+        return synchronized(this) {
+            val today = getTodayKey()
+            var total = 0L
+            for (id in projectIds) {
+                total += projectFocusTime[id]?.get(today) ?: 0L
+            }
+            if (!isPaused && activeProject != null && projectIds.contains(activeProject)) {
+                total += getActiveTrackingOverlapForDay(today)
+            }
+            total
+        }
+    }
+
+    fun getTotalFocusTimeForProjects(projectIds: Set<String>): Long {
+        if (projectIds.isEmpty()) return 0L
+        return synchronized(this) {
+            var total = 0L
+            for (id in projectIds) {
+                total += projectFocusTime[id]?.values?.sum() ?: 0L
+            }
+            if (!isPaused && activeProject != null && projectIds.contains(activeProject)) {
+                total += getActiveTrackingTotalMillis()
+            }
+            total
+        }
+    }
+
+    fun getPeriodFocusTimeForProjects(days: Int, projectIds: Set<String>): Map<String, Long> {
+        if (projectIds.isEmpty()) return emptyMap()
+        return synchronized(this) {
+            val result = mutableMapOf<String, Long>()
+            val today = LocalDate.now()
+
+            for (i in (days - 1) downTo 0) {
+                val date = today.minusDays(i.toLong())
+                val key = date.format(DateTimeFormatter.ISO_LOCAL_DATE)
+                result[key] = 0L
+            }
+
+            for (id in projectIds) {
+                val dateMap = projectFocusTime[id] ?: continue
+                for ((day, millis) in dateMap) {
+                    if (result.containsKey(day)) {
+                        result[day] = (result[day] ?: 0L) + millis
+                    }
+                }
+            }
+
+            if (!isPaused && activeProject != null && projectIds.contains(activeProject)) {
+                val active = getActiveTrackingInterval()
+                if (active != null) {
+                    for (key in result.keys) {
+                        val overlap = overlapMillisWithDay(active.first, active.second, key)
+                        if (overlap > 0L) {
+                            result[key] = (result[key] ?: 0L) + overlap
+                        }
+                    }
+                }
+            }
+
+            result
+        }
+    }
+
+    fun getAiTodayTimeForProjects(projectIds: Set<String>): Long {
+        if (projectIds.isEmpty()) return 0L
+        return synchronized(this) {
+            val todayKey = getTodayKey()
+            val now = System.currentTimeMillis()
+            var total = 0L
+            for (id in projectIds) {
+                total += aiProjectTime[id]?.get(todayKey) ?: 0L
+                val segment = aiActiveSegments[id]
+                if (segment != null) {
+                    val end = minOf(now, segment.endMillis)
+                    total += overlapMillisWithDay(segment.startMillis, end, todayKey)
+                }
+            }
+            total
+        }
+    }
+
+    fun getAiTotalTimeForProjects(projectIds: Set<String>): Long {
+        if (projectIds.isEmpty()) return 0L
+        return synchronized(this) {
+            var total = 0L
+            val now = System.currentTimeMillis()
+            for (id in projectIds) {
+                total += aiProjectTime[id]?.values?.sum() ?: 0L
+                val segment = aiActiveSegments[id]
+                if (segment != null) {
+                    val end = minOf(now, segment.endMillis)
+                    total += (end - segment.startMillis).coerceAtLeast(0L)
+                }
+            }
+            total
+        }
+    }
+
+    fun getAiPeriodTimeForProjects(days: Int, projectIds: Set<String>): Map<String, Long> {
+        if (projectIds.isEmpty()) return emptyMap()
+        return synchronized(this) {
+            val result = mutableMapOf<String, Long>()
+            val today = LocalDate.now()
+
+            for (i in (days - 1) downTo 0) {
+                val date = today.minusDays(i.toLong())
+                val key = date.format(DateTimeFormatter.ISO_LOCAL_DATE)
+                result[key] = 0L
+            }
+
+            for (id in projectIds) {
+                val dateMap = aiProjectTime[id] ?: continue
+                for ((day, millis) in dateMap) {
+                    if (result.containsKey(day)) {
+                        result[day] = (result[day] ?: 0L) + millis
+                    }
+                }
+            }
+
+            val now = System.currentTimeMillis()
+            for (id in projectIds) {
+                val segment = aiActiveSegments[id] ?: continue
+                val start = segment.startMillis
+                val end = minOf(now, segment.endMillis)
+                if (end <= start) continue
+                for (key in result.keys) {
+                    val overlap = overlapMillisWithDay(start, end, key)
+                    if (overlap > 0L) {
+                        result[key] = (result[key] ?: 0L) + overlap
+                    }
+                }
+            }
+
+            result
         }
     }
 

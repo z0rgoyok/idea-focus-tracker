@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.focustracker"
-version = "1.0.6"
+version = "1.0.21"
 
 repositories {
     mavenCentral()

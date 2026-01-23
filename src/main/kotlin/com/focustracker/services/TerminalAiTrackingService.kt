@@ -48,9 +48,12 @@ class TerminalAiTrackingService : Disposable {
     private val lastMarkedAtByProjectId = ConcurrentHashMap<String, Long>()
     private val jediSnapshots = Collections.synchronizedMap(WeakHashMap<JBTerminalWidget, JediSnapshot>())
     private val terminalRoots = Collections.synchronizedMap(WeakHashMap<Component, TerminalProjectInfo>())
+    @Volatile
+    private var isEnabled: Boolean = FocusTimeState.getInstance().isAiTrackingEnabled
 
     private val keyEventDispatcher = KeyEventDispatcher { e ->
         try {
+            if (!isEnabled) return@KeyEventDispatcher false
             if (!shouldCountKeyEvent(e)) return@KeyEventDispatcher false
 
             val component = e.component ?: return@KeyEventDispatcher false
@@ -86,6 +89,7 @@ class TerminalAiTrackingService : Disposable {
     }
 
     fun startTracking(project: Project) {
+        if (!isEnabled) return
         if (project.isDisposed) return
         trackedProjects.add(project)
         ensureStarted()
@@ -99,6 +103,7 @@ class TerminalAiTrackingService : Disposable {
     }
 
     private fun ensureStarted() {
+        if (!isEnabled) return
         if (periodicTask != null) return
 
         periodicTask = scheduler.scheduleAtFixedRate({
@@ -111,6 +116,7 @@ class TerminalAiTrackingService : Disposable {
     }
 
     private fun tick() {
+        if (!isEnabled) return
         val now = System.currentTimeMillis()
         val last = lastHeartbeatAt
         lastHeartbeatAt = now
@@ -254,12 +260,33 @@ class TerminalAiTrackingService : Disposable {
     }
 
     private fun markAiActivity(projectId: String, projectName: String? = null) {
+        if (!isEnabled) return
         val now = System.currentTimeMillis()
 
         val lastMarkedAt = lastMarkedAtByProjectId.put(projectId, now) ?: 0L
         if (now - lastMarkedAt < 1_000L) return
 
         FocusTimeState.getInstance().recordAiActivity(projectId = projectId, projectName = projectName, nowMillis = now)
+    }
+
+    fun setAiTrackingEnabled(enabled: Boolean) {
+        isEnabled = enabled
+        if (!enabled) {
+            val now = System.currentTimeMillis()
+            FocusTimeState.getInstance().endAiSegmentsAt(now)
+            lastMarkedAtByProjectId.clear()
+        } else {
+            val projects = ProjectManager.getInstance().openProjects.filter { !it.isDisposed }
+            for (p in projects) {
+                trackedProjects.add(p)
+                application.invokeLater {
+                    if (!p.isDisposed) {
+                        scanAndAttach(p)
+                    }
+                }
+            }
+            ensureStarted()
+        }
     }
 
     private fun shouldCountKeyEvent(e: KeyEvent): Boolean {

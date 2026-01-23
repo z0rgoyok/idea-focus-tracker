@@ -4,18 +4,23 @@ import com.focustracker.services.FocusTrackingService
 import com.focustracker.state.FocusTimeState
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.table.JBTable
+import com.intellij.ui.SearchTextField
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.*
 import java.time.LocalDate
 import java.time.format.TextStyle
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.*
 import javax.swing.*
+import javax.swing.Scrollable
 import javax.swing.table.AbstractTableModel
 import javax.swing.table.DefaultTableCellRenderer
 
@@ -29,20 +34,37 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
     private val statusIndicator = JPanel()
     private val pauseButton = JButton()
 
+    private val projectFilterField = SearchTextField().apply {
+        textEditor.emptyText.text = "Filter projects (name or path)"
+    }
+
     private val periodOptions = arrayOf("5 days", "7 days", "14 days", "30 days")
     private val periodDays = intArrayOf(5, 7, 14, 30)
     private val periodComboBox = com.intellij.openapi.ui.ComboBox(periodOptions)
     private var selectedPeriodDays = 7
 
-    private val historyFilterOptions = arrayOf("All", "Mine", "AI")
-    private val historyFilterComboBox = com.intellij.openapi.ui.ComboBox(historyFilterOptions)
-    private var selectedHistoryFilter = HistoryFilter.ALL
+    private val historyFilterComboBox = com.intellij.openapi.ui.ComboBox(arrayOf("Mine"))
+    private var selectedHistoryFilter = HistoryFilter.MINE
 
     private val periodChartPanel = PeriodChartPanel()
     private val projectsTableModel = ProjectsTableModel()
     private val projectsTable = JBTable(projectsTableModel)
     private val aiProjectsTableModel = ProjectsTableModel()
     private val aiProjectsTable = JBTable(aiProjectsTableModel)
+
+    private val aiSectionLabel = createSectionLabel("AI")
+    private val mainScrollPane: JBScrollPane
+    private val aiProjectsPanel = createProjectsPanel(aiProjectsTable)
+
+    private var lastHeavyRefreshAt: Long = 0L
+    private var lastFilterText: String = ""
+    private var lastHeavyPeriodDays: Int = selectedPeriodDays
+    private var lastHeavyHistoryFilter: HistoryFilter = selectedHistoryFilter
+
+    @Volatile
+    private var recentPathsCacheAt: Long = 0L
+    @Volatile
+    private var recentPathsByProjectIdCache: Map<String, String> = emptyMap()
 
     private val updateListener: () -> Unit = { refreshData() }
 
@@ -58,13 +80,44 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         }
 
         // Setup history filter
-        historyFilterComboBox.selectedIndex = 0 // Default to All
+        historyFilterComboBox.selectedIndex = 0 // Default to Mine (AI disabled by default)
         historyFilterComboBox.addActionListener {
-            selectedHistoryFilter = HistoryFilter.entries[historyFilterComboBox.selectedIndex]
+            selectedHistoryFilter = when (historyFilterComboBox.selectedItem as? String) {
+                "All" -> HistoryFilter.ALL
+                "AI" -> HistoryFilter.AI
+                else -> HistoryFilter.MINE
+            }
             refreshData()
+            if (selectedHistoryFilter == HistoryFilter.AI) {
+                scrollToAiSection()
+            }
         }
 
-        val contentPanel = JPanel().apply {
+        projectFilterField.textEditor.document.addDocumentListener(object : javax.swing.event.DocumentListener {
+            override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = refreshData()
+            override fun removeUpdate(e: javax.swing.event.DocumentEvent?) = refreshData()
+            override fun changedUpdate(e: javax.swing.event.DocumentEvent?) = refreshData()
+        })
+
+        val contentPanel = object : JPanel(), Scrollable {
+            override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
+
+            override fun getScrollableUnitIncrement(
+                visibleRect: Rectangle,
+                orientation: Int,
+                direction: Int
+            ): Int = 16
+
+            override fun getScrollableBlockIncrement(
+                visibleRect: Rectangle,
+                orientation: Int,
+                direction: Int
+            ): Int = visibleRect.height - 16
+
+            override fun getScrollableTracksViewportWidth(): Boolean = true
+
+            override fun getScrollableTracksViewportHeight(): Boolean = false
+        }.apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
         }
@@ -78,13 +131,13 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         contentPanel.add(Box.createVerticalStrut(24))
 
         // Projects section
-        contentPanel.add(createSectionLabel("Projects"))
+        contentPanel.add(createProjectsHeaderPanel())
         contentPanel.add(Box.createVerticalStrut(8))
         contentPanel.add(createProjectsPanel(projectsTable))
         contentPanel.add(Box.createVerticalStrut(16))
-        contentPanel.add(createSectionLabel("AI"))
+        contentPanel.add(aiSectionLabel)
         contentPanel.add(Box.createVerticalStrut(8))
-        contentPanel.add(createProjectsPanel(aiProjectsTable))
+        contentPanel.add(aiProjectsPanel)
         contentPanel.add(Box.createVerticalStrut(24))
 
         // Period chart with selector
@@ -92,12 +145,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         contentPanel.add(Box.createVerticalStrut(8))
         contentPanel.add(periodChartPanel)
 
-        val scrollPane = JBScrollPane(contentPanel).apply {
+        mainScrollPane = JBScrollPane(contentPanel).apply {
             border = null
             horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
         }
 
-        add(scrollPane, BorderLayout.CENTER)
+        add(mainScrollPane, BorderLayout.CENTER)
 
         // Register for updates
         FocusTrackingService.getInstance().addListener(updateListener)
@@ -105,7 +158,59 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             FocusTrackingService.getInstance().removeListener(updateListener)
         })
 
+        val aiEnabled = FocusTimeState.getInstance().isAiTrackingEnabled
+        configureHistoryFilterOptions(aiEnabled)
+        aiSectionLabel.isVisible = aiEnabled
+        aiProjectsPanel.isVisible = aiEnabled
         refreshData()
+    }
+
+    private fun createProjectsHeaderPanel(): JPanel {
+        return JPanel(BorderLayout(8, 0)).apply {
+            isOpaque = false
+            maximumSize = Dimension(Int.MAX_VALUE, 30)
+            preferredSize = Dimension(0, 30)
+            alignmentX = Component.LEFT_ALIGNMENT
+
+            projectFilterField.apply {
+                minimumSize = Dimension(0, 28)
+                preferredSize = Dimension(360, 28)
+                maximumSize = Dimension(Int.MAX_VALUE, 28)
+            }
+
+            add(createSectionLabel("Projects"), BorderLayout.WEST)
+            add(projectFilterField, BorderLayout.CENTER)
+        }
+    }
+
+    private fun configureHistoryFilterOptions(aiEnabled: Boolean) {
+        val items = if (aiEnabled) arrayOf("All", "Mine", "AI") else arrayOf("Mine")
+        val current = historyFilterComboBox.selectedItem as? String
+
+        historyFilterComboBox.model = DefaultComboBoxModel(items)
+
+        val desired = when {
+            !aiEnabled -> "Mine"
+            current in items -> current
+            selectedHistoryFilter == HistoryFilter.AI -> "AI"
+            selectedHistoryFilter == HistoryFilter.ALL -> "All"
+            else -> "Mine"
+        }
+
+        historyFilterComboBox.selectedItem = desired
+        selectedHistoryFilter = when (desired) {
+            "All" -> HistoryFilter.ALL
+            "AI" -> HistoryFilter.AI
+            else -> HistoryFilter.MINE
+        }
+    }
+
+    private fun scrollToAiSection() {
+        if (!aiSectionLabel.isVisible) return
+        SwingUtilities.invokeLater {
+            val rect = SwingUtilities.convertRectangle(aiSectionLabel.parent, aiSectionLabel.bounds, mainScrollPane.viewport.view)
+            mainScrollPane.viewport.scrollRectToVisible(rect)
+        }
     }
 
     private fun createHeaderPanel(): JPanel {
@@ -216,8 +321,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
 
         return JPanel(BorderLayout()).apply {
             isOpaque = false
-            maximumSize = Dimension(Int.MAX_VALUE, 200)
-            preferredSize = Dimension(400, 150)
+            maximumSize = Dimension(Int.MAX_VALUE, 400)
+            preferredSize = Dimension(400, 300)
 
             val scrollPane = JBScrollPane(table).apply {
                 border = BorderFactory.createLineBorder(JBColor.border(), 1)
@@ -263,6 +368,19 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val state = FocusTimeState.getInstance()
         val service = FocusTrackingService.getInstance()
         val knownProjects = service.getOpenProjectsInfo()
+        val aiEnabled = state.isAiTrackingEnabled
+        val projectFilter = projectFilterField.text.trim().lowercase()
+        val filterChanged = projectFilter != lastFilterText
+        val heavyPeriodChanged = selectedPeriodDays != lastHeavyPeriodDays
+        val heavyHistoryChanged = selectedHistoryFilter != lastHeavyHistoryFilter
+        val filterFocused = projectFilterField.textEditor.hasFocus()
+
+        val recentPathsByProjectId = if (projectFilter.isBlank()) emptyMap() else getRecentProjectPathsById()
+        val filteredProjectIds = if (projectFilter.isBlank()) {
+            emptySet()
+        } else {
+            resolveFilteredProjectIds(state, knownProjects, recentPathsByProjectId, projectFilter)
+        }
 
         // Update status
         val isPaused = service.isPaused()
@@ -291,9 +409,20 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         pauseButton.icon = if (isPaused) AllIcons.Actions.Resume else AllIcons.Actions.Pause
         pauseButton.toolTipText = if (isPaused) "Resume tracking" else "Pause tracking"
 
-        // Get period data
-        val focusPeriodData = state.getPeriodFocusTime(selectedPeriodDays)
-        val aiPeriodData = state.getAiPeriodTime(selectedPeriodDays)
+        // Get period data (optionally filtered by project substring).
+        val focusPeriodData = if (projectFilter.isBlank()) {
+            state.getPeriodFocusTime(selectedPeriodDays)
+        } else {
+            state.getPeriodFocusTimeForProjects(selectedPeriodDays, filteredProjectIds)
+        }
+
+        val aiPeriodData = if (!aiEnabled) {
+            emptyMap()
+        } else if (projectFilter.isBlank()) {
+            state.getAiPeriodTime(selectedPeriodDays)
+        } else {
+            state.getAiPeriodTimeForProjects(selectedPeriodDays, filteredProjectIds)
+        }
 
         val periodData = when (selectedHistoryFilter) {
             HistoryFilter.ALL -> focusPeriodData.mapValues { (k, v) -> v + (aiPeriodData[k] ?: 0L) }
@@ -301,18 +430,46 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             HistoryFilter.AI -> aiPeriodData
         }
 
+        val todayMine = if (projectFilter.isBlank()) {
+            state.getTodayFocusTime()
+        } else {
+            state.getTodayFocusTimeForProjects(filteredProjectIds)
+        }
+
+        val todayAi = if (!aiEnabled) {
+            0L
+        } else if (projectFilter.isBlank()) {
+            state.getAiTodayTime()
+        } else {
+            state.getAiTodayTimeForProjects(filteredProjectIds)
+        }
+
         val todayMillis = when (selectedHistoryFilter) {
-            HistoryFilter.ALL -> state.getTodayFocusTime() + state.getAiTodayTime()
-            HistoryFilter.MINE -> state.getTodayFocusTime()
-            HistoryFilter.AI -> state.getAiTodayTime()
+            HistoryFilter.ALL -> todayMine + todayAi
+            HistoryFilter.MINE -> todayMine
+            HistoryFilter.AI -> todayAi
         }
 
         val periodMillis = periodData.values.sum()
 
+        val allTimeMine = if (projectFilter.isBlank()) {
+            state.getTotalFocusTime()
+        } else {
+            state.getTotalFocusTimeForProjects(filteredProjectIds)
+        }
+
+        val allTimeAi = if (!aiEnabled) {
+            0L
+        } else if (projectFilter.isBlank()) {
+            state.getAiTotalTime()
+        } else {
+            state.getAiTotalTimeForProjects(filteredProjectIds)
+        }
+
         val allTimeMillis = when (selectedHistoryFilter) {
-            HistoryFilter.ALL -> state.getTotalFocusTime() + state.getAiTotalTime()
-            HistoryFilter.MINE -> state.getTotalFocusTime()
-            HistoryFilter.AI -> state.getAiTotalTime()
+            HistoryFilter.ALL -> allTimeMine + allTimeAi
+            HistoryFilter.MINE -> allTimeMine
+            HistoryFilter.AI -> allTimeAi
         }
 
         // Update stats
@@ -321,12 +478,133 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         periodTotalLabel.text = formatDuration(periodMillis)
         allTimeTotalLabel.text = formatDuration(allTimeMillis)
 
-        // Update projects table
-        projectsTableModel.updateData(state.getAllProjectsStats(knownProjects), service.getActiveProjectId())
-        aiProjectsTableModel.updateData(state.getAiProjectsStats(knownProjects), service.getActiveProjectId())
+        val now = System.currentTimeMillis()
+        val refreshInterval = if (filterFocused) {
+            HEAVY_REFRESH_INTERVAL_FOCUSED_MILLIS
+        } else {
+            HEAVY_REFRESH_INTERVAL_MILLIS
+        }
 
-        // Update chart
-        periodChartPanel.updateData(periodData, selectedPeriodDays)
+        val shouldHeavyRefresh =
+            filterChanged || heavyPeriodChanged || heavyHistoryChanged || (now - lastHeavyRefreshAt >= refreshInterval)
+
+        if (shouldHeavyRefresh) {
+            // Update projects tables
+            val mineRows = state.getAllProjectsStats(knownProjects)
+            val aiRows = if (aiEnabled) state.getAiProjectsStats(knownProjects) else emptyList()
+
+            val mineFilteredRows = if (projectFilter.isBlank()) {
+                mineRows
+            } else {
+                mineRows.filter { it.id != "__unassigned__" && filteredProjectIds.contains(it.id) }
+            }
+
+            val aiFilteredRows = if (projectFilter.isBlank()) {
+                aiRows
+            } else {
+                aiRows.filter { filteredProjectIds.contains(it.id) }
+            }
+
+            projectsTableModel.updateData(mineFilteredRows, service.getActiveProjectId())
+            if (aiEnabled) {
+                aiProjectsTableModel.updateData(aiFilteredRows, service.getActiveProjectId())
+            } else {
+                aiProjectsTableModel.updateData(emptyList(), service.getActiveProjectId())
+            }
+
+            // Update chart
+            periodChartPanel.updateData(periodData, selectedPeriodDays)
+
+            lastHeavyRefreshAt = now
+            lastFilterText = projectFilter
+            lastHeavyPeriodDays = selectedPeriodDays
+            lastHeavyHistoryFilter = selectedHistoryFilter
+        }
+    }
+
+    private fun resolveFilteredProjectIds(
+        state: FocusTimeState,
+        knownProjects: List<FocusTimeState.ProjectInfo>,
+        recentPathsByProjectId: Map<String, String>,
+        filterLower: String
+    ): Set<String> {
+        val candidates = LinkedHashSet<String>()
+        candidates.addAll(knownProjects.map { it.id })
+        synchronized(state) {
+            candidates.addAll(state.projectFocusTime.keys)
+            candidates.addAll(state.aiProjectTime.keys)
+            candidates.addAll(state.aiActiveSegments.keys)
+            state.activeProject?.let(candidates::add)
+        }
+
+        return candidates.filterTo(LinkedHashSet()) { projectId ->
+            if (projectId == "__unassigned__") return@filterTo false
+            val name = state.getProjectDisplayName(projectId).lowercase()
+            if (name.contains(filterLower)) return@filterTo true
+
+            val path = (
+                state.getProjectPath(projectId)
+                    ?: recentPathsByProjectId[projectId]
+                    ?: knownProjects.firstOrNull { it.id == projectId }?.path
+                )
+                ?.lowercase()
+                ?: ""
+            path.contains(filterLower)
+        }
+    }
+
+    private fun getRecentProjectPathsById(): Map<String, String> {
+        val now = System.currentTimeMillis()
+        val cachedAt = recentPathsCacheAt
+        if (now - cachedAt <= RECENT_PATHS_CACHE_TTL_MILLIS && recentPathsByProjectIdCache.isNotEmpty()) {
+            return recentPathsByProjectIdCache
+        }
+
+        val optionsDir = try {
+            Path.of(PathManager.getOptionsPath())
+        } catch (_: Throwable) {
+            return recentPathsByProjectIdCache
+        }
+        val file = optionsDir.resolve("recentProjects.xml")
+        if (!Files.exists(file)) return recentPathsByProjectIdCache
+
+        val userHome = System.getProperty("user.home").orEmpty()
+
+        fun expandUserHomeMacros(path: String): String {
+            var result = path.trim()
+            if (userHome.isNotBlank()) {
+                result = result.replace("\$USER_HOME\$", userHome)
+                if (result.startsWith("~/")) {
+                    result = userHome.trimEnd('/') + "/" + result.removePrefix("~/")
+                }
+            }
+            return result.trimEnd('/')
+        }
+
+        val map = LinkedHashMap<String, String>()
+        val entryRegex = Regex("""<entry\s+key="([^"]+)"""")
+        try {
+            Files.newBufferedReader(file).use { reader ->
+                reader.lineSequence().forEach { line ->
+                    val match = entryRegex.find(line) ?: return@forEach
+                    val raw = match.groupValues[1]
+                    if (raw.isBlank()) return@forEach
+
+                    val expanded = expandUserHomeMacros(raw)
+                    // Keep only absolute or user-home based paths.
+                    if (!expanded.startsWith("/") && !expanded.startsWith(userHome)) return@forEach
+
+                    val projectId = "loc:" + Integer.toHexString(expanded.hashCode())
+                    map.putIfAbsent(projectId, expanded)
+                }
+            }
+        } catch (_: Throwable) {
+            return recentPathsByProjectIdCache
+        }
+
+        recentPathsByProjectIdCache = map
+        recentPathsCacheAt = now
+        return map
     }
 
     private fun formatDuration(millis: Long): String {
@@ -335,11 +613,7 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val minutes = (seconds % 3600) / 60
         val secs = seconds % 60
 
-        return if (hours > 0) {
-            String.format("%d:%02d:%02d", hours, minutes, secs)
-        } else {
-            String.format("%02d:%02d", minutes, secs)
-        }
+        return String.format("%02d:%02d:%02d", hours, minutes, secs)
     }
 
     override fun dispose() {
@@ -350,6 +624,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         ALL,
         MINE,
         AI
+    }
+
+    companion object {
+        private const val HEAVY_REFRESH_INTERVAL_MILLIS = 2_000L
+        private const val HEAVY_REFRESH_INTERVAL_FOCUSED_MILLIS = 5_000L
+        private const val RECENT_PATHS_CACHE_TTL_MILLIS = 10_000L
     }
 }
 
@@ -367,7 +647,9 @@ class ProjectsTableModel : AbstractTableModel() {
     )
 
     fun updateData(stats: List<FocusTimeState.ProjectStatsRow>, activeProjectId: String?) {
-        projects = stats.map { stat ->
+        val previousIndexById = projects.withIndex().associate { it.value.id to it.index }
+
+        val next = stats.map { stat ->
             ProjectRow(
                 id = stat.id,
                 name = stat.name,
@@ -375,10 +657,28 @@ class ProjectsTableModel : AbstractTableModel() {
                 totalTime = stat.totalTime,
                 isActive = stat.id == activeProjectId
             )
-        }.sortedWith(
-            compareBy<ProjectRow> { it.id == unassignedProjectId }
-                .thenByDescending { it.todayTime }
-        )
+        }
+
+        projects = next.sortedWith { a, b ->
+            val aUnassigned = a.id == unassignedProjectId
+            val bUnassigned = b.id == unassignedProjectId
+            if (aUnassigned != bUnassigned) {
+                return@sortedWith if (aUnassigned) 1 else -1
+            }
+
+            val aPrev = previousIndexById[a.id]
+            val bPrev = previousIndexById[b.id]
+            if (aPrev != null && bPrev != null) {
+                return@sortedWith aPrev.compareTo(bPrev)
+            }
+            if (aPrev != null) return@sortedWith -1
+            if (bPrev != null) return@sortedWith 1
+
+            val byToday = b.todayTime.compareTo(a.todayTime)
+            if (byToday != 0) return@sortedWith byToday
+
+            a.name.compareTo(b.name)
+        }
 
         fireTableDataChanged()
     }
