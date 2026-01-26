@@ -166,7 +166,7 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
     }
 
     private fun createProjectsHeaderPanel(): JPanel {
-        return JPanel(BorderLayout(8, 0)).apply {
+        return JPanel(GridBagLayout()).apply {
             isOpaque = false
             maximumSize = Dimension(Int.MAX_VALUE, 30)
             preferredSize = Dimension(0, 30)
@@ -178,8 +178,25 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                 maximumSize = Dimension(Int.MAX_VALUE, 28)
             }
 
-            add(createSectionLabel("Projects"), BorderLayout.WEST)
-            add(projectFilterField, BorderLayout.CENTER)
+            val labelConstraints = GridBagConstraints().apply {
+                gridx = 0
+                gridy = 0
+                weightx = 0.0
+                fill = GridBagConstraints.NONE
+                anchor = GridBagConstraints.WEST
+                insets = Insets(0, 0, 0, 8)
+            }
+
+            val fieldConstraints = GridBagConstraints().apply {
+                gridx = 1
+                gridy = 0
+                weightx = 1.0
+                fill = GridBagConstraints.HORIZONTAL
+                anchor = GridBagConstraints.WEST
+            }
+
+            add(createSectionLabel("Projects"), labelConstraints)
+            add(projectFilterField, fieldConstraints)
         }
     }
 
