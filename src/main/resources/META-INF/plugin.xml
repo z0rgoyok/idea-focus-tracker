@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.focustracker.idea-focus-tracker</id>
     <name>Focus Time Tracker</name>
-    <version>1.0.22</version>
+    <version>1.0.23</version>
     <vendor email="support@example.com" url="https://github.com/example/idea-focus-tracker">
         Focus Tracker
     </vendor>

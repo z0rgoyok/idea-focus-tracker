@@ -79,6 +79,22 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         return projectPaths[projectId]
     }
 
+    /**
+     * Returns display name with parent directory prefix for disambiguation.
+     * Example: "work/MyApp" instead of just "MyApp"
+     */
+    fun getProjectDisplayNameWithParent(projectId: String): String {
+        val name = getProjectDisplayName(projectId)
+        val path = projectPaths[projectId] ?: return name
+
+        val parentName = java.io.File(path).parentFile?.name
+        return if (parentName != null && parentName.isNotBlank()) {
+            "$parentName/$name"
+        } else {
+            name
+        }
+    }
+
     private fun isProjectId(value: String): Boolean =
         value.startsWith(PROJECT_ID_NAME_PREFIX) || value.startsWith(PROJECT_ID_LOCATION_PREFIX)
 
@@ -337,7 +353,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
                 rows.add(
                     ProjectStatsRow(
                         id = projectId,
-                        name = getProjectDisplayName(projectId),
+                        name = getProjectDisplayNameWithParent(projectId),
                         todayTime = todayTime + activeTodayTime,
                         totalTime = totalTime + activeTotalTime
                     )
@@ -397,7 +413,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
 
                 ProjectStatsRow(
                     id = projectId,
-                    name = getProjectDisplayName(projectId),
+                    name = getProjectDisplayNameWithParent(projectId),
                     todayTime = storedToday + activeToday,
                     totalTime = storedTotal + activeTotal
                 )
