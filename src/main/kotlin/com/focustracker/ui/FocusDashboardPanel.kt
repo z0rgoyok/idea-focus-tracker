@@ -573,9 +573,20 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             HistoryFilter.AI -> allTimeAi
         }
 
+        val sessionMillis = if (projectFilter.isBlank()) {
+            service.getCurrentSessionTime()
+        } else {
+            val activeProjectId = service.getActiveProjectId()
+            if (activeProjectId != null && filteredProjectIds.contains(activeProjectId)) {
+                service.getCurrentSessionTime()
+            } else {
+                0L
+            }
+        }
+
         // Update stats
         todayTimeLabel.text = formatDuration(todayMillis)
-        sessionTimeLabel.text = formatDuration(service.getCurrentSessionTime())
+        sessionTimeLabel.text = formatDuration(sessionMillis)
         periodTotalLabel.text = formatDuration(periodMillis)
         allTimeTotalLabel.text = formatDuration(allTimeMillis)
 
@@ -1027,6 +1038,12 @@ class PeriodChartPanel : JPanel() {
     private fun formatShortDuration(millis: Long): String {
         val minutes = millis / 60000
         val hours = minutes / 60
-        return if (hours > 0) "${hours}h" else "${minutes}m"
+        if (hours <= 0) return "${minutes}m"
+        val remainderMinutes = (minutes % 60).toInt()
+        return if (remainderMinutes == 0) {
+            "${hours}h"
+        } else {
+            "${hours}h${remainderMinutes}m"
+        }
     }
 }

@@ -67,6 +67,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
     override fun loadState(state: FocusTimeState) {
         XmlSerializerUtil.copyBean(state, this)
         migrateLegacyProjectKeys()
+        migrateMissingBranchData()
         flushExpiredAiSegments(System.currentTimeMillis())
     }
 
@@ -156,6 +157,55 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         for (projectId in projectFocusTime.keys + aiProjectTime.keys) {
             if (!projectDisplayNames.containsKey(projectId)) {
                 projectDisplayNames[projectId] = getProjectDisplayName(projectId)
+            }
+        }
+    }
+
+    /**
+     * Branch breakdown (branchFocusTime) was introduced after project totals (projectFocusTime).
+     * For older data we may have project totals without per-branch attribution.
+     *
+     * To avoid confusing UI sums (project != sum(branches)), we attribute any missing per-day
+     * remainder to [UNKNOWN_BRANCH].
+     */
+    internal fun migrateMissingBranchData() {
+        synchronized(this) {
+            if (projectFocusTime.isEmpty()) return
+
+            for ((projectId, projectDates) in projectFocusTime) {
+                if (projectDates.isEmpty()) continue
+                if (isIgnoredProjectId(projectId)) continue
+
+                val projectBranches = branchFocusTime.getOrPut(projectId) { mutableMapOf() }
+
+                // Precompute per-day sum across existing branches.
+                val summedByDate = mutableMapOf<String, Long>()
+                for (dateMap in projectBranches.values) {
+                    for ((date, millis) in dateMap) {
+                        summedByDate[date] = (summedByDate[date] ?: 0L) + millis
+                    }
+                }
+
+                var unknownDates: MutableMap<String, Long>? = projectBranches[UNKNOWN_BRANCH]
+                for ((date, projectMillis) in projectDates) {
+                    val branchMillis = summedByDate[date] ?: 0L
+                    val missing = projectMillis - branchMillis
+                    if (missing > 0L) {
+                        val target = if (unknownDates != null) {
+                            unknownDates
+                        } else {
+                            val created = projectBranches.getOrPut(UNKNOWN_BRANCH) { mutableMapOf() }
+                            unknownDates = created
+                            created
+                        }
+                        target[date] = (target[date] ?: 0L) + missing
+                    }
+                }
+
+                // Avoid creating empty "(unknown)" branches.
+                if (unknownDates != null && unknownDates.isEmpty()) {
+                    projectBranches.remove(UNKNOWN_BRANCH)
+                }
             }
         }
     }
