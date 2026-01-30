@@ -130,11 +130,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         contentPanel.add(createStatsCardsPanel())
         contentPanel.add(Box.createVerticalStrut(24))
 
-        // Projects section
+        // Projects section (with branch grouping)
         contentPanel.add(createProjectsHeaderPanel())
         contentPanel.add(Box.createVerticalStrut(8))
         contentPanel.add(createProjectsPanel(projectsTable))
         contentPanel.add(Box.createVerticalStrut(16))
+
         contentPanel.add(aiSectionLabel)
         contentPanel.add(Box.createVerticalStrut(8))
         contentPanel.add(aiProjectsPanel)
@@ -314,6 +315,38 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             rowHeight = 28
             tableHeader.reorderingAllowed = false
 
+            val model = table.model as? ProjectsTableModel
+            val headerBg = JBColor(Color(240, 240, 245), Color(55, 55, 60))
+
+            // Custom renderer for project/branch name column
+            val nameRenderer = object : DefaultTableCellRenderer() {
+                override fun getTableCellRendererComponent(
+                    table: JTable?, value: Any?, isSelected: Boolean,
+                    hasFocus: Boolean, row: Int, column: Int
+                ): Component {
+                    super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+                    border = JBUI.Borders.empty(0, 8)
+
+                    val modelRow = if (table != null) table.convertRowIndexToModel(row) else row
+                    val isHeader = model?.isHeaderRow(modelRow) == true
+                    font = if (isHeader) {
+                        font.deriveFont(Font.BOLD)
+                    } else {
+                        font.deriveFont(Font.PLAIN)
+                    }
+                    foreground = if (isHeader) {
+                        JBColor.foreground()
+                    } else {
+                        JBColor.gray
+                    }
+                    if (!isSelected) {
+                        background = if (isHeader) headerBg else UIUtil.getTableBackground()
+                    }
+                    isOpaque = true
+                    return this
+                }
+            }
+
             // Custom renderer for time columns
             val timeRenderer = object : DefaultTableCellRenderer() {
                 override fun getTableCellRendererComponent(
@@ -323,10 +356,28 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                     super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
                     horizontalAlignment = SwingConstants.RIGHT
                     border = JBUI.Borders.empty(0, 8)
+
+                    val modelRow = if (table != null) table.convertRowIndexToModel(row) else row
+                    val isHeader = model?.isHeaderRow(modelRow) == true
+                    font = if (isHeader) {
+                        font.deriveFont(Font.BOLD)
+                    } else {
+                        font.deriveFont(Font.PLAIN)
+                    }
+                    foreground = if (isHeader) {
+                        JBColor.foreground()
+                    } else {
+                        JBColor.gray
+                    }
+                    if (!isSelected) {
+                        background = if (isHeader) headerBg else UIUtil.getTableBackground()
+                    }
+                    isOpaque = true
                     return this
                 }
             }
 
+            columnModel.getColumn(0).cellRenderer = nameRenderer
             columnModel.getColumn(1).cellRenderer = timeRenderer
             columnModel.getColumn(2).cellRenderer = timeRenderer
 
@@ -334,6 +385,37 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             columnModel.getColumn(0).preferredWidth = 200
             columnModel.getColumn(1).preferredWidth = 100
             columnModel.getColumn(2).preferredWidth = 100
+
+            // Expand/collapse branches when clicking a project header row.
+            if (model != null) {
+                addMouseListener(object : java.awt.event.MouseAdapter() {
+                    override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                        if (!SwingUtilities.isLeftMouseButton(e) || e.clickCount != 1) return
+                        val viewRow = rowAtPoint(e.point)
+                        if (viewRow < 0) return
+                        val modelRow = convertRowIndexToModel(viewRow)
+                        if (!model.isHeaderRow(modelRow)) return
+                        if (!model.isExpandableHeaderRow(modelRow)) return
+                        model.toggleExpanded(modelRow)
+                    }
+                })
+
+                addMouseMotionListener(object : java.awt.event.MouseMotionAdapter() {
+                    override fun mouseMoved(e: java.awt.event.MouseEvent) {
+                        val viewRow = rowAtPoint(e.point)
+                        if (viewRow < 0) {
+                            cursor = Cursor.getDefaultCursor()
+                            return
+                        }
+                        val modelRow = convertRowIndexToModel(viewRow)
+                        cursor = if (model.isExpandableHeaderRow(modelRow)) {
+                            Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                        } else {
+                            Cursor.getDefaultCursor()
+                        }
+                    }
+                })
+            }
         }
 
         return JPanel(BorderLayout()).apply {
@@ -402,9 +484,11 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         // Update status
         val isPaused = service.isPaused()
         val isFocused = service.isFocused()
+        val activeBranch = service.getActiveBranch()
 
         val statusText = when {
             isPaused -> "Paused"
+            isFocused && activeBranch != null -> "Tracking ($activeBranch)"
             isFocused -> "Tracking"
             else -> "Not in focus"
         }
@@ -522,11 +606,11 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                 aiRows.filter { filteredProjectIds.contains(it.id) }
             }
 
-            projectsTableModel.updateData(mineFilteredRows, service.getActiveProjectId())
+            projectsTableModel.updateData(mineFilteredRows, state, service.getActiveProjectId(), activeBranch)
             if (aiEnabled) {
-                aiProjectsTableModel.updateData(aiFilteredRows, service.getActiveProjectId())
+                aiProjectsTableModel.updateData(aiFilteredRows, state, service.getActiveProjectId(), activeBranch)
             } else {
-                aiProjectsTableModel.updateData(emptyList(), service.getActiveProjectId())
+                aiProjectsTableModel.updateData(emptyList(), state, service.getActiveProjectId(), activeBranch)
             }
 
             // Update chart
@@ -652,44 +736,72 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
 
 class ProjectsTableModel : AbstractTableModel() {
 
-    private var projects: List<ProjectRow> = emptyList()
+    private var rows: List<DisplayRow> = emptyList()
     private val unassignedProjectId = "__unassigned__"
+    private val expandedProjectIds: MutableSet<String> = LinkedHashSet()
+    private var lastStats: List<FocusTimeState.ProjectStatsRow> = emptyList()
+    private var lastState: FocusTimeState? = null
+    private var lastActiveProjectId: String? = null
+    private var lastActiveBranch: String? = null
 
-    data class ProjectRow(
-        val id: String,
-        val name: String,
-        val todayTime: Long,
-        val totalTime: Long,
-        val isActive: Boolean
-    )
+    sealed class DisplayRow {
+        data class ProjectHeader(
+            val id: String,
+            val name: String,
+            val todayTime: Long,
+            val totalTime: Long,
+            val isActive: Boolean,
+            val hasBranches: Boolean,
+            val isExpanded: Boolean
+        ) : DisplayRow()
 
-    fun updateData(stats: List<FocusTimeState.ProjectStatsRow>, activeProjectId: String?) {
-        val previousIndexById = projects.withIndex().associate { it.value.id to it.index }
+        data class BranchRow(
+            val projectId: String,
+            val branch: String,
+            val todayTime: Long,
+            val totalTime: Long,
+            val isActiveBranch: Boolean
+        ) : DisplayRow()
+    }
 
-        val next = stats.map { stat ->
-            ProjectRow(
-                id = stat.id,
-                name = stat.name,
-                todayTime = stat.todayTime,
-                totalTime = stat.totalTime,
-                isActive = stat.id == activeProjectId
-            )
+    fun updateData(
+        stats: List<FocusTimeState.ProjectStatsRow>,
+        state: FocusTimeState,
+        activeProjectId: String?,
+        activeBranch: String?
+    ) {
+        lastStats = stats
+        lastState = state
+        lastActiveProjectId = activeProjectId
+        lastActiveBranch = activeBranch
+        rebuildRows()
+    }
+
+    private fun rebuildRows() {
+        val state = lastState ?: run {
+            rows = emptyList()
+            fireTableDataChanged()
+            return
         }
 
-        projects = next.sortedWith { a, b ->
+        val result = mutableListOf<DisplayRow>()
+
+        // Sort projects: active first, then by today time
+        val activeProjectId = lastActiveProjectId
+        val activeBranch = lastActiveBranch
+        val sortedStats = lastStats.sortedWith { a, b ->
             val aUnassigned = a.id == unassignedProjectId
             val bUnassigned = b.id == unassignedProjectId
             if (aUnassigned != bUnassigned) {
                 return@sortedWith if (aUnassigned) 1 else -1
             }
 
-            val aPrev = previousIndexById[a.id]
-            val bPrev = previousIndexById[b.id]
-            if (aPrev != null && bPrev != null) {
-                return@sortedWith aPrev.compareTo(bPrev)
+            // Active project first
+            val aActive = a.id == activeProjectId
+            val bActive = b.id == activeProjectId
+            if (aActive != bActive) {
+                return@sortedWith if (aActive) -1 else 1
             }
-            if (aPrev != null) return@sortedWith -1
-            if (bPrev != null) return@sortedWith 1
 
             val byToday = b.todayTime.compareTo(a.todayTime)
             if (byToday != 0) return@sortedWith byToday
@@ -697,27 +809,115 @@ class ProjectsTableModel : AbstractTableModel() {
             a.name.compareTo(b.name)
         }
 
+        for (stat in sortedStats) {
+            val isActiveProject = stat.id == activeProjectId
+
+            // Get branches for this project
+            val branches = state.getBranchesStats(stat.id)
+            val hasBranches = branches.isNotEmpty()
+            val isExpanded = expandedProjectIds.contains(stat.id)
+
+            result.add(
+                DisplayRow.ProjectHeader(
+                    id = stat.id,
+                    name = stat.name,
+                    todayTime = stat.todayTime,
+                    totalTime = stat.totalTime,
+                    isActive = isActiveProject,
+                    hasBranches = hasBranches,
+                    isExpanded = isExpanded
+                )
+            )
+
+            if (hasBranches && isExpanded) {
+                // Sort branches: active first, then by total time
+                val sortedBranches = branches.sortedWith { a, b ->
+                    val aActive = isActiveProject && a.branch == activeBranch
+                    val bActive = isActiveProject && b.branch == activeBranch
+                    if (aActive != bActive) {
+                        return@sortedWith if (aActive) -1 else 1
+                    }
+                    b.totalTime.compareTo(a.totalTime)
+                }
+
+                for (branchStat in sortedBranches) {
+                    result.add(
+                        DisplayRow.BranchRow(
+                            projectId = stat.id,
+                            branch = branchStat.branch,
+                            todayTime = branchStat.todayTime,
+                            totalTime = branchStat.totalTime,
+                            isActiveBranch = isActiveProject && branchStat.branch == activeBranch
+                        )
+                    )
+                }
+            }
+        }
+
+        rows = result
         fireTableDataChanged()
     }
 
-    override fun getRowCount(): Int = projects.size
+    fun isHeaderRow(rowIndex: Int): Boolean {
+        return rows.getOrNull(rowIndex) is DisplayRow.ProjectHeader
+    }
+
+    fun isExpandableHeaderRow(rowIndex: Int): Boolean {
+        return when (val row = rows.getOrNull(rowIndex)) {
+            is DisplayRow.ProjectHeader -> row.hasBranches
+            else -> false
+        }
+    }
+
+    fun toggleExpanded(rowIndex: Int) {
+        val row = rows.getOrNull(rowIndex) as? DisplayRow.ProjectHeader ?: return
+        if (!row.hasBranches) return
+        if (expandedProjectIds.contains(row.id)) {
+            expandedProjectIds.remove(row.id)
+        } else {
+            expandedProjectIds.add(row.id)
+        }
+        rebuildRows()
+    }
+
+    override fun getRowCount(): Int = rows.size
 
     override fun getColumnCount(): Int = 3
 
     override fun getColumnName(column: Int): String = when (column) {
-        0 -> "Project"
+        0 -> "Project / Branch"
         1 -> "Today"
         2 -> "Total"
         else -> ""
     }
 
     override fun getValueAt(rowIndex: Int, columnIndex: Int): Any {
-        val row = projects[rowIndex]
-        return when (columnIndex) {
-            0 -> if (row.isActive) "● ${row.name}" else row.name
-            1 -> formatDuration(row.todayTime)
-            2 -> formatDuration(row.totalTime)
-            else -> ""
+        return when (val row = rows[rowIndex]) {
+            is DisplayRow.ProjectHeader -> when (columnIndex) {
+                0 -> {
+                    val marker = if (row.isActive) "● " else ""
+                    val disclosure = if (!row.hasBranches) {
+                        "  "
+                    } else if (row.isExpanded) {
+                        "▾ "
+                    } else {
+                        "▸ "
+                    }
+                    "$disclosure$marker${row.name}"
+                }
+                1 -> formatDuration(row.todayTime)
+                2 -> formatDuration(row.totalTime)
+                else -> ""
+            }
+            is DisplayRow.BranchRow -> when (columnIndex) {
+                0 -> {
+                    val prefix = if (row.isActiveBranch) "    ● " else "      "
+                    "${prefix}↳ ${row.branch}"
+                }
+                1 -> formatDuration(row.todayTime)
+                2 -> formatDuration(row.totalTime)
+                else -> ""
+            }
         }
     }
 

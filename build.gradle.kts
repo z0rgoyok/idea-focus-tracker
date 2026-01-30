@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.focustracker"
-version = "1.0.22"
+version = "1.0.28"
 
 repositories {
     mavenCentral()
@@ -17,12 +17,19 @@ repositories {
 dependencies {
     intellijPlatform {
         intellijIdeaCommunity("2023.3")
+        bundledPlugin("Git4Idea")
         pluginVerifier()
     }
+
+    testImplementation(kotlin("test"))
 }
 
 kotlin {
     jvmToolchain(17)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 intellijPlatform {

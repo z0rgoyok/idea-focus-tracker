@@ -23,6 +23,12 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
     // Map of project id to (date -> milliseconds)
     var projectFocusTime: MutableMap<String, MutableMap<String, Long>> = mutableMapOf()
 
+    // Map of project id to (branch -> (date -> milliseconds))
+    var branchFocusTime: MutableMap<String, MutableMap<String, MutableMap<String, Long>>> = mutableMapOf()
+
+    // Currently active branch for the active project
+    var activeBranch: String? = null
+
     // AI/Terminal activity: total across all projects (date -> milliseconds)
     var aiDailyTime: MutableMap<String, Long> = mutableMapOf()
 
@@ -97,6 +103,9 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
 
     private fun isProjectId(value: String): Boolean =
         value.startsWith(PROJECT_ID_NAME_PREFIX) || value.startsWith(PROJECT_ID_LOCATION_PREFIX)
+
+    private fun isIgnoredProjectId(projectId: String): Boolean =
+        getProjectDisplayName(projectId) == DEFAULT_TEMPLATE_PROJECT_NAME
 
     private fun migrateLegacyProjectKeys() {
         activeProject?.let { current ->
@@ -339,6 +348,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             ids.remove(UNASSIGNED_PROJECT_ID)
 
             for (projectId in ids) {
+                if (isIgnoredProjectId(projectId)) continue
                 val dateMap = projectFocusTime[projectId] ?: emptyMap()
                 val todayTime = dateMap[today] ?: 0L
                 val totalTime = dateMap.values.sum()
@@ -402,6 +412,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             ids.addAll(aiActiveSegments.keys)
 
             ids.map { projectId ->
+                if (isIgnoredProjectId(projectId)) return@map null
                 val dateMap = aiProjectTime[projectId] ?: emptyMap()
                 val storedToday = dateMap[today] ?: 0L
                 val storedTotal = dateMap.values.sum()
@@ -417,7 +428,7 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
                     todayTime = storedToday + activeToday,
                     totalTime = storedTotal + activeTotal
                 )
-            }
+            }.filterNotNull()
         }
     }
 
@@ -633,6 +644,125 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         val totalTime: Long
     )
 
+    data class BranchStatsRow(
+        val projectId: String,
+        val branch: String,
+        val todayTime: Long,
+        val totalTime: Long
+    )
+
+    /**
+     * Records focus time for a specific branch.
+     * Called by FocusTrackingService when saving focus time.
+     */
+    fun recordBranchTime(projectId: String, branch: String?, dateKey: String, elapsed: Long) {
+        val branchKey = branch ?: UNKNOWN_BRANCH
+        val projectBranches = branchFocusTime.getOrPut(projectId) { mutableMapOf() }
+        val branchDates = projectBranches.getOrPut(branchKey) { mutableMapOf() }
+        branchDates[dateKey] = (branchDates[dateKey] ?: 0L) + elapsed
+    }
+
+    /**
+     * Gets all branches for a specific project with their statistics.
+     */
+    fun getBranchesStats(projectId: String): List<BranchStatsRow> {
+        return synchronized(this) {
+            val today = getTodayKey()
+            val projectBranches = branchFocusTime[projectId] ?: return@synchronized emptyList()
+
+            val rows = mutableListOf<BranchStatsRow>()
+            for ((branch, dateMap) in projectBranches) {
+                val todayTime = dateMap[today] ?: 0L
+                val totalTime = dateMap.values.sum()
+
+                // Add active tracking time if this is the active branch
+                val (activeTodayTime, activeTotalTime) = if (!isPaused && activeProject == projectId && activeBranch == branch) {
+                    getActiveTrackingOverlapForDay(today) to getActiveTrackingTotalMillis()
+                } else {
+                    0L to 0L
+                }
+
+                rows.add(
+                    BranchStatsRow(
+                        projectId = projectId,
+                        branch = if (branch == UNKNOWN_BRANCH) "(unknown)" else branch,
+                        todayTime = todayTime + activeTodayTime,
+                        totalTime = totalTime + activeTotalTime
+                    )
+                )
+            }
+
+            // If active branch is not yet in the stored data, add it with active tracking time only
+            if (!isPaused && activeProject == projectId && activeBranch != null) {
+                val branchKey = activeBranch ?: UNKNOWN_BRANCH
+                if (!projectBranches.containsKey(branchKey)) {
+                    rows.add(
+                        BranchStatsRow(
+                            projectId = projectId,
+                            branch = if (branchKey == UNKNOWN_BRANCH) "(unknown)" else branchKey,
+                            todayTime = getActiveTrackingOverlapForDay(today),
+                            totalTime = getActiveTrackingTotalMillis()
+                        )
+                    )
+                }
+            }
+
+            rows.sortedByDescending { it.totalTime }
+        }
+    }
+
+    /**
+     * Gets today's focus time for a specific branch.
+     */
+    fun getBranchTodayFocusTime(projectId: String, branch: String): Long {
+        return synchronized(this) {
+            val today = getTodayKey()
+            val stored = branchFocusTime[projectId]?.get(branch)?.get(today) ?: 0L
+
+            val activeTime = if (!isPaused && activeProject == projectId && activeBranch == branch) {
+                getActiveTrackingOverlapForDay(today)
+            } else 0L
+
+            stored + activeTime
+        }
+    }
+
+    /**
+     * Gets total focus time for a specific branch.
+     */
+    fun getBranchTotalFocusTime(projectId: String, branch: String): Long {
+        return synchronized(this) {
+            val stored = branchFocusTime[projectId]?.get(branch)?.values?.sum() ?: 0L
+
+            val activeTime = if (!isPaused && activeProject == projectId && activeBranch == branch) {
+                getActiveTrackingTotalMillis()
+            } else 0L
+
+            stored + activeTime
+        }
+    }
+
+    /**
+     * Gets the display name for a branch.
+     */
+    fun getBranchDisplayName(branch: String): String {
+        return if (branch == UNKNOWN_BRANCH) "(unknown)" else branch
+    }
+
+    /**
+     * Gets all unique branches across all projects for filtering.
+     */
+    fun getAllBranches(): Set<String> {
+        return synchronized(this) {
+            val branches = mutableSetOf<String>()
+            for ((_, projectBranches) in branchFocusTime) {
+                branches.addAll(projectBranches.keys)
+            }
+            activeBranch?.let { branches.add(it) }
+            branches
+        }
+    }
+
     private fun getActiveTrackingInterval(): Pair<Long, Long>? {
         if (isPaused) return null
         val start = sessionStartTime ?: return null
@@ -666,7 +796,9 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         private const val PROJECT_ID_NAME_PREFIX = "name:"
         private const val PROJECT_ID_LOCATION_PREFIX = "loc:"
         private const val UNASSIGNED_PROJECT_ID = "__unassigned__"
+        const val UNKNOWN_BRANCH = "__unknown__"
         private const val AI_IDLE_THRESHOLD_MILLIS = 10 * 1000L
+        private const val DEFAULT_TEMPLATE_PROJECT_NAME = "Default (Template) Project"
 
         fun getInstance(): FocusTimeState =
             ApplicationManager.getApplication().getService(FocusTimeState::class.java)

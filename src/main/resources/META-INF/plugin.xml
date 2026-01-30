@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.focustracker.idea-focus-tracker</id>
     <name>Focus Time Tracker</name>
-    <version>1.0.23</version>
+    <version>1.0.24</version>
     <vendor email="support@example.com" url="https://github.com/example/idea-focus-tracker">
         Focus Tracker
     </vendor>
@@ -38,6 +38,7 @@
 
     <depends>com.intellij.modules.platform</depends>
     <depends optional="true">org.jetbrains.plugins.terminal</depends>
+    <depends optional="true" config-file="git-integration.xml">Git4Idea</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- Application-level service for focus tracking -->

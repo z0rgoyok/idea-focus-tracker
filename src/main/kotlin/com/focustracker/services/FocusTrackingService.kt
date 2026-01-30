@@ -3,6 +3,7 @@ package com.focustracker.services
 import com.focustracker.state.FocusTimeState
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -58,21 +59,9 @@ class FocusTrackingService : Disposable {
     private val awtActivityListener = java.awt.event.AWTEventListener { event ->
         try {
             if (!isIdeaWindowFocused) return@AWTEventListener
+            if (!isActivityEventFromIdeaWindow(event)) return@AWTEventListener
 
-            when (event) {
-                is MouseEvent -> {
-                    // Ignore pure enter/exit noise; count real interactions/movement.
-                    if (event.id == MouseEvent.MOUSE_ENTERED || event.id == MouseEvent.MOUSE_EXITED) return@AWTEventListener
-                }
-
-                is MouseWheelEvent -> Unit
-
-                is KeyEvent -> {
-                    if (event.id != KeyEvent.KEY_PRESSED) return@AWTEventListener
-                }
-
-                else -> return@AWTEventListener
-            }
+            if (!UserActivityEvents.isMeaningful(event)) return@AWTEventListener
 
             lastUserActivityAt = System.currentTimeMillis()
 
@@ -82,6 +71,36 @@ class FocusTrackingService : Disposable {
         } catch (_: Throwable) {
             // ignore
         }
+    }
+
+    private fun isActivityEventFromIdeaWindow(event: AWTEvent): Boolean {
+        val eventWindow = when (event) {
+            is MouseEvent -> event.component?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? java.awt.Component)?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? Window)
+
+            is MouseWheelEvent -> event.component?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? java.awt.Component)?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? Window)
+
+            is KeyEvent -> event.component?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? java.awt.Component)?.let(SwingUtilities::getWindowAncestor)
+                ?: (event.source as? Window)
+
+            else -> null
+        }
+
+        val projectFrames = WindowManager.getInstance().allProjectFrames
+        val matchedProject = resolveProjectForWindow(eventWindow, projectFrames)
+        val activeFrameProject = resolveActiveProjectFromFrames(projectFrames)
+
+        return matchedProject != null ||
+            activeFrameProject != null ||
+            eventWindow?.javaClass?.name?.let { className ->
+                className.contains("intellij", ignoreCase = true) ||
+                    className.contains("idea", ignoreCase = true) ||
+                    className.contains("jetbrains", ignoreCase = true)
+            } == true
     }
 
     private val focusPropertyListener = PropertyChangeListener { evt ->
@@ -102,12 +121,59 @@ class FocusTrackingService : Disposable {
     @Volatile
     private var recentProjectsBackfilled = false
 
+    @Volatile
+    private var currentActiveProject: Project? = null
+
     private fun getProjectId(project: Project): String {
         val locationHash = project.locationHash
         return if (locationHash.isNotBlank()) {
             "loc:$locationHash"
         } else {
             "name:${project.name}"
+        }
+    }
+
+    /**
+     * Gets the current Git branch for the given project.
+     * Returns null if Git4Idea is not available or project has no Git repo.
+     */
+    private fun getCurrentBranch(project: Project?): String? {
+        if (project == null || project.isDisposed) return null
+        return try {
+            val gitService = GitBranchService.getInstanceOrNull() ?: return null
+            ReadAction.compute<String?, Throwable> {
+                gitService.getCurrentBranch(project)
+            }
+        } catch (e: Exception) {
+            log.debug("Unable to get current branch", e)
+            null
+        }
+    }
+
+    /**
+     * Updates the active branch in state if it has changed.
+     * Saves time for the previous branch before switching.
+     */
+    private fun checkBranchChange() {
+        if (!isIdeaFocused) return
+        val project = currentActiveProject ?: return
+        if (project.isDisposed) return
+
+        val state = FocusTimeState.getInstance()
+        if (state.isPaused) return
+
+        val currentBranch = getCurrentBranch(project)
+        val previousBranch = synchronized(state) { state.activeBranch }
+
+        if (currentBranch != previousBranch) {
+            log.info("Branch changed from $previousBranch to $currentBranch")
+            // Save time for previous branch before switching
+            saveFocusTime()
+            synchronized(state) {
+                state.activeBranch = currentBranch
+                state.sessionStartTime = System.currentTimeMillis()
+            }
+            notifyListeners()
         }
     }
 
@@ -147,6 +213,7 @@ class FocusTrackingService : Disposable {
             try {
                 handlePossibleSystemSuspend()
                 handleUserIdle()
+                checkBranchChange()
                 saveFocusTime()
                 checkDateChange()
                 notifyListeners()
@@ -255,6 +322,7 @@ class FocusTrackingService : Disposable {
             focusGainStartTask = null
             pendingFocusProjectId = null
             pendingFocusProjectName = null
+            pendingFocusProject = null
             notifyListeners()
         }
 
@@ -269,11 +337,15 @@ class FocusTrackingService : Disposable {
     @Volatile
     private var pendingFocusProjectName: String? = null
 
+    @Volatile
+    private var pendingFocusProject: Project? = null
+
     private fun updatePendingProject(project: Project?) {
-        if (project == null || project.isDisposed) return
+        if (project == null || project.isDisposed || project.isDefault) return
         val projectId = getProjectId(project)
         pendingFocusProjectId = projectId
         pendingFocusProjectName = project.name
+        pendingFocusProject = project
         val state = FocusTimeState.getInstance()
         synchronized(state) {
             state.projectDisplayNames[projectId] = project.name
@@ -293,6 +365,7 @@ class FocusTrackingService : Disposable {
                         focusGainStartTask = null
                         pendingFocusProjectId = null
                         pendingFocusProjectName = null
+                        pendingFocusProject = null
                         notifyListeners()
                         return@Runnable
                     }
@@ -327,8 +400,16 @@ class FocusTrackingService : Disposable {
         val now = System.currentTimeMillis()
         val projectId = pendingFocusProjectId
         val projectName = pendingFocusProjectName
+        val project = pendingFocusProject
         pendingFocusProjectId = null
         pendingFocusProjectName = null
+        pendingFocusProject = null
+
+        // Update current active project reference
+        currentActiveProject = project
+
+        // Get current branch for the project
+        val branch = getCurrentBranch(project)
 
         synchronized(state) {
             val todayKey = state.getTodayKey()
@@ -338,6 +419,7 @@ class FocusTrackingService : Disposable {
 
             state.sessionStartTime = now
             state.focusSessionStartTime = now
+            state.activeBranch = branch
             if (projectId != null) {
                 state.activeProject = projectId
                 if (projectName != null) {
@@ -381,16 +463,22 @@ class FocusTrackingService : Disposable {
         val project = resolveProjectForWindow(window, WindowManager.getInstance().allProjectFrames)
         updatePendingProject(project)
 
+        // Update current active project and get branch
+        currentActiveProject = project
+        val branch = getCurrentBranch(project)
+
         val now = System.currentTimeMillis()
         synchronized(state) {
             state.sessionStartTime = now
             state.focusSessionStartTime = now
             state.sessionDate = state.getTodayKey()
+            state.activeBranch = branch
             pendingFocusProjectId?.let { state.activeProject = it }
         }
 
         pendingFocusProjectId = null
         pendingFocusProjectName = null
+        pendingFocusProject = null
 
         isIdlePaused = false
         isIdeaFocused = true
@@ -421,7 +509,7 @@ class FocusTrackingService : Disposable {
         }
 
         val openProjects = ProjectManager.getInstance().openProjects.filter { !it.isDisposed }
-        return openProjects.singleOrNull()
+        return openProjects.filterNot { it.isDefault }.singleOrNull()
     }
 
     private fun findActiveFrameWindow(projectFrames: Array<out IdeFrame>): Window? {
@@ -466,7 +554,7 @@ class FocusTrackingService : Disposable {
             state.sessionStartTime = now
             state.focusSessionStartTime = now
             // Avoid dropping the last known project when we can't resolve it for a focused IDEA dialog/window.
-            state.activeProject = project?.let { p ->
+            state.activeProject = project?.takeIf { !it.isDefault }?.let { p ->
                 val projectId = getProjectId(p)
                 state.projectDisplayNames[projectId] = p.name
                 projectId
@@ -477,6 +565,7 @@ class FocusTrackingService : Disposable {
     }
 
     private fun onProjectChanged(project: Project) {
+        if (project.isDefault) return
         val state = FocusTimeState.getInstance()
 
         val projectId = getProjectId(project)
@@ -485,6 +574,8 @@ class FocusTrackingService : Disposable {
             if (state.activeProject == projectId) return
             if (state.isPaused) {
                 state.activeProject = projectId
+                currentActiveProject = project
+                state.activeBranch = getCurrentBranch(project)
                 return
             }
         }
@@ -494,10 +585,17 @@ class FocusTrackingService : Disposable {
         // Save time for previous project
         saveFocusTime()
 
+        // Update current active project reference
+        currentActiveProject = project
+
+        // Get current branch for the new project
+        val branch = getCurrentBranch(project)
+
         // Start tracking new project
         synchronized(state) {
             state.sessionStartTime = System.currentTimeMillis()
             state.activeProject = projectId
+            state.activeBranch = branch
         }
 
         notifyListeners()
@@ -604,6 +702,7 @@ class FocusTrackingService : Disposable {
 
             val clampedStart = minOf(startTime, now)
             val projectId = state.activeProject
+            val branch = state.activeBranch
 
             var cursor = clampedStart
             var date = Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()
@@ -620,6 +719,9 @@ class FocusTrackingService : Disposable {
                 if (projectId != null) {
                     val projectData = state.projectFocusTime.getOrPut(projectId) { mutableMapOf() }
                     projectData[dateKey] = (projectData[dateKey] ?: 0L) + elapsed
+
+                    // Also record branch-level time
+                    state.recordBranchTime(projectId, branch, dateKey, elapsed)
                 }
 
                 totalSaved += elapsed
@@ -636,7 +738,7 @@ class FocusTrackingService : Disposable {
                 state.sessionStartTime = null
             }
 
-            log.debug("Saved focus time: ${totalSaved}ms, project: $projectId")
+            log.debug("Saved focus time: ${totalSaved}ms, project: $projectId, branch: $branch")
         }
     }
 
@@ -786,7 +888,7 @@ class FocusTrackingService : Disposable {
     }
 
     fun getOpenProjectsInfo(): List<FocusTimeState.ProjectInfo> {
-        val openProjects = ProjectManager.getInstance().openProjects.filter { !it.isDisposed }
+        val openProjects = ProjectManager.getInstance().openProjects.filter { !it.isDisposed && !it.isDefault }
         return openProjects.map { p ->
             val projectId = getProjectId(p)
             val state = FocusTimeState.getInstance()
@@ -806,11 +908,22 @@ class FocusTrackingService : Disposable {
 
     fun getActiveProjectName(): String? = getActiveProjectDisplayName()
 
+    fun getActiveBranch(): String? {
+        val state = FocusTimeState.getInstance()
+        return synchronized(state) { state.activeBranch }
+    }
+
     override fun dispose() {
         log.info("Disposing focus tracking service")
 
-        // Save final state
-        saveFocusTime()
+        // Save final state, but do not keep an "active" session across IDE shutdown.
+        // Otherwise, the next IDE start may attribute the whole offline gap to focus time.
+        saveFocusTime(nowMillis = System.currentTimeMillis(), continueTracking = false)
+        val state = FocusTimeState.getInstance()
+        synchronized(state) {
+            state.sessionStartTime = null
+            state.focusSessionStartTime = null
+        }
 
         // Remove listeners
         KeyboardFocusManager.getCurrentKeyboardFocusManager()

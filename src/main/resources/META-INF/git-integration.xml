@@ -1,0 +1,7 @@
+<idea-plugin>
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Git branch resolver service (active when Git4Idea is available) -->
+        <applicationService
+            serviceImplementation="com.focustracker.services.GitBranchService"/>
+    </extensions>
+</idea-plugin>
