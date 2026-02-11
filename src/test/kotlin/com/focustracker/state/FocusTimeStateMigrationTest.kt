@@ -2,6 +2,7 @@ package com.focustracker.state
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 
 class FocusTimeStateMigrationTest {
 
@@ -65,5 +66,19 @@ class FocusTimeStateMigrationTest {
 
         val unknown = state.branchFocusTime["loc:test"]?.get(FocusTimeState.UNKNOWN_BRANCH)
         assertEquals(null, unknown?.get("2026-01-30"))
+    }
+
+    @Test
+    fun `loadState clears transient session markers`() {
+        val persisted = FocusTimeState().apply {
+            sessionStartTime = 1_770_821_769_902L
+            focusSessionStartTime = 1_770_821_768_703L
+        }
+
+        val restored = FocusTimeState()
+        restored.loadState(persisted)
+
+        assertNull(restored.sessionStartTime)
+        assertNull(restored.focusSessionStartTime)
     }
 }

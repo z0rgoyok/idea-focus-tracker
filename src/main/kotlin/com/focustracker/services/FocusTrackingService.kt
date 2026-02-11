@@ -183,6 +183,14 @@ class FocusTrackingService : Disposable {
 
         log.info("Starting focus tracking service")
 
+        // Session markers should never survive IDE restart/crash.
+        // Clear them before periodic save starts to avoid offline-gap spikes.
+        val state = FocusTimeState.getInstance()
+        synchronized(state) {
+            state.sessionStartTime = null
+            state.focusSessionStartTime = null
+        }
+
         // Best-effort backfill for older state entries that may not have stored paths yet.
         scheduler.execute { backfillProjectPathsFromRecentProjects() }
 

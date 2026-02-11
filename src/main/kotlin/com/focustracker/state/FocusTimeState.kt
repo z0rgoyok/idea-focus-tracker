@@ -66,9 +66,17 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
 
     override fun loadState(state: FocusTimeState) {
         XmlSerializerUtil.copyBean(state, this)
+        clearTransientSessionState()
         migrateLegacyProjectKeys()
         migrateMissingBranchData()
         flushExpiredAiSegments(System.currentTimeMillis())
+    }
+
+    private fun clearTransientSessionState() {
+        // Session markers are runtime-only; if they survive a crash/restart,
+        // the next run can attribute offline time as focused.
+        sessionStartTime = null
+        focusSessionStartTime = null
     }
 
     fun getTodayKey(): String = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
