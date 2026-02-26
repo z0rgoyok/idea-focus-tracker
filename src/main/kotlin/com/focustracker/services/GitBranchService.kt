@@ -32,8 +32,13 @@ class GitBranchService {
 
             if (repositories.isEmpty()) return null
 
-            // If multiple repos, use the first one (usually the root repo)
-            val repository = repositories.firstOrNull() ?: return null
+            // If multiple repositories are present, prefer one with an attached branch.
+            // This avoids false nulls when the first repo is detached or not fully initialized.
+            val repository =
+                repositories.firstOrNull { it.currentBranch != null }
+                    ?: repositories.firstOrNull { it.currentRevision != null }
+                    ?: repositories.firstOrNull()
+                    ?: return null
             getBranchName(repository)
         } catch (e: Exception) {
             log.debug("Unable to get current branch for project ${project.name}", e)

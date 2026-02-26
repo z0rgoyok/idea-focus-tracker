@@ -590,6 +590,103 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
         }
     }
 
+    fun getTodayFocusTimeForProjectBranches(projectBranches: Map<String, Set<String>>): Long {
+        if (projectBranches.isEmpty()) return 0L
+        return synchronized(this) {
+            val today = getTodayKey()
+            var total = 0L
+
+            for ((projectId, branchKeys) in projectBranches) {
+                if (branchKeys.isEmpty()) continue
+                val branches = branchFocusTime[projectId].orEmpty()
+                for (branch in branchKeys) {
+                    total += branches[branch]?.get(today) ?: 0L
+                }
+
+                if (!isPaused && activeProject == projectId) {
+                    val currentBranch = activeBranch ?: UNKNOWN_BRANCH
+                    if (branchKeys.contains(currentBranch)) {
+                        total += getActiveTrackingOverlapForDay(today)
+                    }
+                }
+            }
+
+            total
+        }
+    }
+
+    fun getTotalFocusTimeForProjectBranches(projectBranches: Map<String, Set<String>>): Long {
+        if (projectBranches.isEmpty()) return 0L
+        return synchronized(this) {
+            var total = 0L
+
+            for ((projectId, branchKeys) in projectBranches) {
+                if (branchKeys.isEmpty()) continue
+                val branches = branchFocusTime[projectId].orEmpty()
+                for (branch in branchKeys) {
+                    total += branches[branch]?.values?.sum() ?: 0L
+                }
+
+                if (!isPaused && activeProject == projectId) {
+                    val currentBranch = activeBranch ?: UNKNOWN_BRANCH
+                    if (branchKeys.contains(currentBranch)) {
+                        total += getActiveTrackingTotalMillis()
+                    }
+                }
+            }
+
+            total
+        }
+    }
+
+    fun getPeriodFocusTimeForProjectBranches(days: Int, projectBranches: Map<String, Set<String>>): Map<String, Long> {
+        if (projectBranches.isEmpty()) return emptyMap()
+        return synchronized(this) {
+            val result = mutableMapOf<String, Long>()
+            val today = LocalDate.now()
+
+            for (i in (days - 1) downTo 0) {
+                val date = today.minusDays(i.toLong())
+                val key = date.format(DateTimeFormatter.ISO_LOCAL_DATE)
+                result[key] = 0L
+            }
+
+            for ((projectId, branchKeys) in projectBranches) {
+                if (branchKeys.isEmpty()) continue
+                val branches = branchFocusTime[projectId].orEmpty()
+                for (branch in branchKeys) {
+                    val dateMap = branches[branch] ?: continue
+                    for ((day, millis) in dateMap) {
+                        if (result.containsKey(day)) {
+                            result[day] = (result[day] ?: 0L) + millis
+                        }
+                    }
+                }
+            }
+
+            if (!isPaused) {
+                val activeProjectId = activeProject
+                if (activeProjectId != null) {
+                    val activeBranchKey = activeBranch ?: UNKNOWN_BRANCH
+                    val activeBranches = projectBranches[activeProjectId]
+                    if (activeBranches != null && activeBranches.contains(activeBranchKey)) {
+                        val active = getActiveTrackingInterval()
+                        if (active != null) {
+                            for (key in result.keys) {
+                                val overlap = overlapMillisWithDay(active.first, active.second, key)
+                                if (overlap > 0L) {
+                                    result[key] = (result[key] ?: 0L) + overlap
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            result
+        }
+    }
+
     fun getAiTodayTimeForProjects(projectIds: Set<String>): Long {
         if (projectIds.isEmpty()) return 0L
         return synchronized(this) {
@@ -818,6 +915,57 @@ class FocusTimeState : PersistentStateComponent<FocusTimeState> {
             }
             activeBranch?.let { branches.add(it) }
             branches
+        }
+    }
+
+    /**
+     * Returns true when the project has at least one branch matching the given filter text.
+     * Also considers the currently active branch even if it has not been persisted yet.
+     */
+    fun projectHasBranchMatching(projectId: String, filterText: String): Boolean {
+        val filterLower = filterText.trim().lowercase()
+        if (filterLower.isBlank()) return false
+
+        return synchronized(this) {
+            val storedBranches = branchFocusTime[projectId].orEmpty().keys
+            if (storedBranches.any { getBranchDisplayName(it).lowercase().contains(filterLower) }) {
+                return@synchronized true
+            }
+
+            if (activeProject == projectId) {
+                val currentBranch = activeBranch ?: UNKNOWN_BRANCH
+                return@synchronized getBranchDisplayName(currentBranch).lowercase().contains(filterLower)
+            }
+
+            false
+        }
+    }
+
+    /**
+     * Returns raw branch keys (including [UNKNOWN_BRANCH]) matching the given filter text.
+     * Also includes the currently active branch when it matches, even before persistence.
+     */
+    fun getBranchKeysMatching(projectId: String, filterText: String): Set<String> {
+        val filterLower = filterText.trim().lowercase()
+        if (filterLower.isBlank()) return emptySet()
+
+        return synchronized(this) {
+            val matches = LinkedHashSet<String>()
+            val storedBranches = branchFocusTime[projectId].orEmpty().keys
+            for (branch in storedBranches) {
+                if (getBranchDisplayName(branch).lowercase().contains(filterLower)) {
+                    matches.add(branch)
+                }
+            }
+
+            if (activeProject == projectId) {
+                val currentBranch = activeBranch ?: UNKNOWN_BRANCH
+                if (getBranchDisplayName(currentBranch).lowercase().contains(filterLower)) {
+                    matches.add(currentBranch)
+                }
+            }
+
+            matches
         }
     }
 

@@ -150,6 +150,35 @@ class FocusTrackingService : Disposable {
         }
     }
 
+    private fun resolveProjectId(project: Project?): String? {
+        if (project == null || project.isDisposed || project.isDefault) return null
+        return getProjectId(project)
+    }
+
+    private fun resolveBranchWithFallback(
+        project: Project?,
+        resolvedProjectId: String?,
+        fallbackProjectId: String?,
+        fallbackBranch: String?
+    ): String? {
+        val branch = getCurrentBranch(project)
+        if (branch != null) return branch
+        // Git branch lookup can be transiently unavailable (e.g. repository model refresh).
+        // For the same project, keep last known branch instead of downgrading to unknown.
+        return if (resolvedProjectId != null && resolvedProjectId == fallbackProjectId) fallbackBranch else null
+    }
+
+    private fun resolveBranchForWrite(projectId: String?, fallbackBranch: String?): String? {
+        if (projectId == null) return null
+        val project = currentActiveProject
+        val resolvedProjectId = resolveProjectId(project)
+        if (resolvedProjectId == projectId) {
+            // Resolve branch as close to persistence as possible.
+            return getCurrentBranch(project) ?: fallbackBranch
+        }
+        return fallbackBranch
+    }
+
     /**
      * Updates the active branch in state if it has changed.
      * Saves time for the previous branch before switching.
@@ -164,6 +193,10 @@ class FocusTrackingService : Disposable {
 
         val currentBranch = getCurrentBranch(project)
         val previousBranch = synchronized(state) { state.activeBranch }
+
+        if (currentBranch == null) {
+            return
+        }
 
         if (currentBranch != previousBranch) {
             log.info("Branch changed from $previousBranch to $currentBranch")
@@ -416,8 +449,10 @@ class FocusTrackingService : Disposable {
         // Update current active project reference
         currentActiveProject = project
 
-        // Get current branch for the project
-        val branch = getCurrentBranch(project)
+        val previousActive = synchronized(state) { state.activeProject to state.activeBranch }
+        val resolvedProjectId = projectId ?: resolveProjectId(project)
+        // Keep last known branch for the same project when Git resolution is temporarily unavailable.
+        val branch = resolveBranchWithFallback(project, resolvedProjectId, previousActive.first, previousActive.second)
 
         synchronized(state) {
             val todayKey = state.getTodayKey()
@@ -473,7 +508,10 @@ class FocusTrackingService : Disposable {
 
         // Update current active project and get branch
         currentActiveProject = project
-        val branch = getCurrentBranch(project)
+        val previousActive = synchronized(state) { state.activeProject to state.activeBranch }
+        val resolvedProjectId = pendingFocusProjectId ?: resolveProjectId(project)
+        // Keep last known branch for the same project when Git resolution is temporarily unavailable.
+        val branch = resolveBranchWithFallback(project, resolvedProjectId, previousActive.first, previousActive.second)
 
         val now = System.currentTimeMillis()
         synchronized(state) {
@@ -710,7 +748,10 @@ class FocusTrackingService : Disposable {
 
             val clampedStart = minOf(startTime, now)
             val projectId = state.activeProject
-            val branch = state.activeBranch
+            val branch = resolveBranchForWrite(projectId, state.activeBranch)
+            if (projectId != null && branch != null && state.activeBranch != branch) {
+                state.activeBranch = branch
+            }
 
             var cursor = clampedStart
             var date = Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()

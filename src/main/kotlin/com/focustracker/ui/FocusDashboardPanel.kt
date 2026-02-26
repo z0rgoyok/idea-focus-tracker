@@ -35,7 +35,7 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
     private val pauseButton = JButton()
 
     private val projectFilterField = SearchTextField().apply {
-        textEditor.emptyText.text = "Filter projects (name or path)"
+        textEditor.emptyText.text = "Filter projects (name, path or branch)"
     }
 
     private val periodOptions = arrayOf("5 days", "7 days", "14 days", "30 days")
@@ -475,11 +475,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val filterFocused = projectFilterField.textEditor.hasFocus()
 
         val recentPathsByProjectId = if (projectFilter.isBlank()) emptyMap() else getRecentProjectPathsById()
-        val filteredProjectIds = if (projectFilter.isBlank()) {
-            emptySet()
+        val filterScope = if (projectFilter.isBlank()) {
+            ProjectFilterScope.EMPTY
         } else {
-            resolveFilteredProjectIds(state, knownProjects, recentPathsByProjectId, projectFilter)
+            resolveProjectFilterScope(state, knownProjects, recentPathsByProjectId, projectFilter)
         }
+        val filteredProjectIds = filterScope.projectIds
 
         // Update status
         val isPaused = service.isPaused()
@@ -514,7 +515,10 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val focusPeriodData = if (projectFilter.isBlank()) {
             state.getPeriodFocusTime(selectedPeriodDays)
         } else {
-            state.getPeriodFocusTimeForProjects(selectedPeriodDays, filteredProjectIds)
+            mergeDailyTotals(
+                state.getPeriodFocusTimeForProjects(selectedPeriodDays, filterScope.fullProjectIds),
+                state.getPeriodFocusTimeForProjectBranches(selectedPeriodDays, filterScope.partialProjectBranches)
+            )
         }
 
         val aiPeriodData = if (!aiEnabled) {
@@ -522,7 +526,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         } else if (projectFilter.isBlank()) {
             state.getAiPeriodTime(selectedPeriodDays)
         } else {
-            state.getAiPeriodTimeForProjects(selectedPeriodDays, filteredProjectIds)
+            // AI is tracked per project only; include it only when the project itself matched the filter.
+            state.getAiPeriodTimeForProjects(selectedPeriodDays, filterScope.fullProjectIds)
         }
 
         val periodData = when (selectedHistoryFilter) {
@@ -534,7 +539,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val todayMine = if (projectFilter.isBlank()) {
             state.getTodayFocusTime()
         } else {
-            state.getTodayFocusTimeForProjects(filteredProjectIds)
+            state.getTodayFocusTimeForProjects(filterScope.fullProjectIds) +
+                state.getTodayFocusTimeForProjectBranches(filterScope.partialProjectBranches)
         }
 
         val todayAi = if (!aiEnabled) {
@@ -542,7 +548,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         } else if (projectFilter.isBlank()) {
             state.getAiTodayTime()
         } else {
-            state.getAiTodayTimeForProjects(filteredProjectIds)
+            // AI is tracked per project only; include it only when the project itself matched the filter.
+            state.getAiTodayTimeForProjects(filterScope.fullProjectIds)
         }
 
         val todayMillis = when (selectedHistoryFilter) {
@@ -556,7 +563,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         val allTimeMine = if (projectFilter.isBlank()) {
             state.getTotalFocusTime()
         } else {
-            state.getTotalFocusTimeForProjects(filteredProjectIds)
+            state.getTotalFocusTimeForProjects(filterScope.fullProjectIds) +
+                state.getTotalFocusTimeForProjectBranches(filterScope.partialProjectBranches)
         }
 
         val allTimeAi = if (!aiEnabled) {
@@ -564,7 +572,8 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         } else if (projectFilter.isBlank()) {
             state.getAiTotalTime()
         } else {
-            state.getAiTotalTimeForProjects(filteredProjectIds)
+            // AI is tracked per project only; include it only when the project itself matched the filter.
+            state.getAiTotalTimeForProjects(filterScope.fullProjectIds)
         }
 
         val allTimeMillis = when (selectedHistoryFilter) {
@@ -577,7 +586,14 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             service.getCurrentSessionTime()
         } else {
             val activeProjectId = service.getActiveProjectId()
-            if (activeProjectId != null && filteredProjectIds.contains(activeProjectId)) {
+            val includeByProject = activeProjectId != null && filterScope.fullProjectIds.contains(activeProjectId)
+            val includeByBranch = if (activeProjectId == null) {
+                false
+            } else {
+                val activeBranchKey = service.getActiveBranch() ?: FocusTimeState.UNKNOWN_BRANCH
+                filterScope.partialProjectBranches[activeProjectId]?.contains(activeBranchKey) == true
+            }
+            if (includeByProject || includeByBranch) {
                 service.getCurrentSessionTime()
             } else {
                 0L
@@ -617,11 +633,29 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                 aiRows.filter { filteredProjectIds.contains(it.id) }
             }
 
-            projectsTableModel.updateData(mineFilteredRows, state, service.getActiveProjectId(), activeBranch)
+            projectsTableModel.updateData(
+                mineFilteredRows,
+                state,
+                service.getActiveProjectId(),
+                activeBranch,
+                projectFilter
+            )
             if (aiEnabled) {
-                aiProjectsTableModel.updateData(aiFilteredRows, state, service.getActiveProjectId(), activeBranch)
+                aiProjectsTableModel.updateData(
+                    aiFilteredRows,
+                    state,
+                    service.getActiveProjectId(),
+                    activeBranch,
+                    projectFilter
+                )
             } else {
-                aiProjectsTableModel.updateData(emptyList(), state, service.getActiveProjectId(), activeBranch)
+                aiProjectsTableModel.updateData(
+                    emptyList(),
+                    state,
+                    service.getActiveProjectId(),
+                    activeBranch,
+                    projectFilter
+                )
             }
 
             // Update chart
@@ -634,12 +668,12 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         }
     }
 
-    private fun resolveFilteredProjectIds(
+    private fun resolveProjectFilterScope(
         state: FocusTimeState,
         knownProjects: List<FocusTimeState.ProjectInfo>,
         recentPathsByProjectId: Map<String, String>,
         filterLower: String
-    ): Set<String> {
+    ): ProjectFilterScope {
         val candidates = LinkedHashSet<String>()
         candidates.addAll(knownProjects.map { it.id })
         synchronized(state) {
@@ -649,10 +683,18 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
             state.activeProject?.let(candidates::add)
         }
 
-        return candidates.filterTo(LinkedHashSet()) { projectId ->
-            if (projectId == "__unassigned__") return@filterTo false
+        val matchedProjectIds = LinkedHashSet<String>()
+        val fullProjectIds = LinkedHashSet<String>()
+        val partialProjectBranches = LinkedHashMap<String, Set<String>>()
+
+        for (projectId in candidates) {
+            if (projectId == "__unassigned__") continue
             val name = state.getProjectDisplayName(projectId).lowercase()
-            if (name.contains(filterLower)) return@filterTo true
+            if (name.contains(filterLower)) {
+                matchedProjectIds.add(projectId)
+                fullProjectIds.add(projectId)
+                continue
+            }
 
             val path = (
                 state.getProjectPath(projectId)
@@ -661,8 +703,37 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
                 )
                 ?.lowercase()
                 ?: ""
-            path.contains(filterLower)
+            if (path.contains(filterLower)) {
+                matchedProjectIds.add(projectId)
+                fullProjectIds.add(projectId)
+                continue
+            }
+
+            val matchingBranches = state.getBranchKeysMatching(projectId, filterLower)
+            if (matchingBranches.isNotEmpty()) {
+                matchedProjectIds.add(projectId)
+                partialProjectBranches[projectId] = matchingBranches
+            }
         }
+
+        return ProjectFilterScope(
+            projectIds = matchedProjectIds,
+            fullProjectIds = fullProjectIds,
+            partialProjectBranches = partialProjectBranches
+        )
+    }
+
+    private fun mergeDailyTotals(
+        first: Map<String, Long>,
+        second: Map<String, Long>
+    ): Map<String, Long> {
+        if (first.isEmpty()) return second
+        if (second.isEmpty()) return first
+        val result = LinkedHashMap(first)
+        for ((day, millis) in second) {
+            result[day] = (result[day] ?: 0L) + millis
+        }
+        return result
     }
 
     private fun getRecentProjectPathsById(): Map<String, String> {
@@ -738,6 +809,16 @@ class FocusDashboardPanel : JPanel(BorderLayout()), Disposable {
         AI
     }
 
+    private data class ProjectFilterScope(
+        val projectIds: Set<String>,
+        val fullProjectIds: Set<String>,
+        val partialProjectBranches: Map<String, Set<String>>
+    ) {
+        companion object {
+            val EMPTY = ProjectFilterScope(emptySet(), emptySet(), emptyMap())
+        }
+    }
+
     companion object {
         private const val HEAVY_REFRESH_INTERVAL_MILLIS = 2_000L
         private const val HEAVY_REFRESH_INTERVAL_FOCUSED_MILLIS = 5_000L
@@ -754,6 +835,7 @@ class ProjectsTableModel : AbstractTableModel() {
     private var lastState: FocusTimeState? = null
     private var lastActiveProjectId: String? = null
     private var lastActiveBranch: String? = null
+    private var lastFilterLower: String = ""
 
     sealed class DisplayRow {
         data class ProjectHeader(
@@ -779,12 +861,14 @@ class ProjectsTableModel : AbstractTableModel() {
         stats: List<FocusTimeState.ProjectStatsRow>,
         state: FocusTimeState,
         activeProjectId: String?,
-        activeBranch: String?
+        activeBranch: String?,
+        filterText: String = ""
     ) {
         lastStats = stats
         lastState = state
         lastActiveProjectId = activeProjectId
         lastActiveBranch = activeBranch
+        lastFilterLower = filterText.trim().lowercase()
         rebuildRows()
     }
 
@@ -800,6 +884,8 @@ class ProjectsTableModel : AbstractTableModel() {
         // Sort projects: active first, then by today time
         val activeProjectId = lastActiveProjectId
         val activeBranch = lastActiveBranch
+        val filterLower = lastFilterLower
+        val hasFilter = filterLower.isNotBlank()
         val sortedStats = lastStats.sortedWith { a, b ->
             val aUnassigned = a.id == unassignedProjectId
             val bUnassigned = b.id == unassignedProjectId
@@ -826,7 +912,13 @@ class ProjectsTableModel : AbstractTableModel() {
             // Get branches for this project
             val branches = state.getBranchesStats(stat.id)
             val hasBranches = branches.isNotEmpty()
-            val isExpanded = expandedProjectIds.contains(stat.id)
+            val matchingBranches = if (hasFilter) {
+                branches.filter { it.branch.lowercase().contains(filterLower) }
+            } else {
+                emptyList()
+            }
+            val hasMatchingBranches = matchingBranches.isNotEmpty()
+            val isExpanded = hasMatchingBranches || expandedProjectIds.contains(stat.id)
 
             result.add(
                 DisplayRow.ProjectHeader(
@@ -841,8 +933,10 @@ class ProjectsTableModel : AbstractTableModel() {
             )
 
             if (hasBranches && isExpanded) {
+                val visibleBranches = if (hasMatchingBranches) matchingBranches else branches
+
                 // Sort branches: active first, then by total time
-                val sortedBranches = branches.sortedWith { a, b ->
+                val sortedBranches = visibleBranches.sortedWith { a, b ->
                     val aActive = isActiveProject && a.branch == activeBranch
                     val bActive = isActiveProject && b.branch == activeBranch
                     if (aActive != bActive) {
