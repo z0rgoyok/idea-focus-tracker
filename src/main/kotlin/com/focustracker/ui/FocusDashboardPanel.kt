@@ -1044,6 +1044,7 @@ class PeriodChartPanel : JPanel() {
 
     private var data: Map<String, Long> = emptyMap()
     private var periodDays: Int = 7
+    private val yAxisTickCount = 4
 
     init {
         preferredSize = Dimension(400, 180)
@@ -1064,25 +1065,39 @@ class PeriodChartPanel : JPanel() {
 
         if (data.isEmpty()) return
 
-        val padding = 20
+        val leftPadding = 52
+        val rightPadding = 20
         val bottomPadding = 25
         val topPadding = 20
         val chartHeight = height - bottomPadding - topPadding
 
         val sortedData = data.toSortedMap()
         val maxValue = data.values.maxOrNull()?.coerceAtLeast(1L) ?: 1L
+        val yAxisStep = calculateAxisStep(maxValue)
+        val yAxisMax = (yAxisStep * yAxisTickCount).coerceAtLeast(1L)
         val today = LocalDate.now()
 
         // Calculate bar width based on number of days
-        val totalWidth = width - padding * 2
+        val totalWidth = width - leftPadding - rightPadding
         val gap = if (periodDays <= 7) 8 else if (periodDays <= 14) 4 else 2
         val barWidth = (totalWidth - gap * (periodDays - 1)) / periodDays
 
-        var x = padding
+        drawYAxis(
+            g2 = g2,
+            chartLeft = leftPadding,
+            chartRight = width - rightPadding,
+            topPadding = topPadding,
+            bottomPadding = bottomPadding,
+            chartHeight = chartHeight,
+            yAxisStep = yAxisStep,
+            yAxisMax = yAxisMax
+        )
+
+        var x = leftPadding
 
         sortedData.forEach { (dateStr, millis) ->
             val date = LocalDate.parse(dateStr)
-            val barHeight = ((millis.toDouble() / maxValue) * chartHeight).toInt()
+            val barHeight = ((millis.toDouble() / yAxisMax) * chartHeight).toInt()
             val y = height - bottomPadding - barHeight
 
             // Bar
@@ -1126,6 +1141,68 @@ class PeriodChartPanel : JPanel() {
             }
 
             x += barWidth + gap
+        }
+    }
+
+    private fun drawYAxis(
+        g2: Graphics2D,
+        chartLeft: Int,
+        chartRight: Int,
+        topPadding: Int,
+        bottomPadding: Int,
+        chartHeight: Int,
+        yAxisStep: Long,
+        yAxisMax: Long
+    ) {
+        g2.font = g2.font.deriveFont(9f)
+
+        for (tick in 0..yAxisTickCount) {
+            val value = yAxisStep * tick
+            val ratio = if (yAxisMax == 0L) 0.0 else value.toDouble() / yAxisMax
+            val y = (height - bottomPadding - (chartHeight * ratio)).toInt()
+
+            g2.color = JBColor(Color(225, 225, 232), Color(82, 82, 92))
+            g2.drawLine(chartLeft, y, chartRight, y)
+
+            val label = formatAxisDuration(value)
+            val metrics = g2.fontMetrics
+            val textY = (y + metrics.ascent / 2).coerceIn(metrics.ascent, height - bottomPadding)
+
+            g2.color = JBColor.gray
+            g2.drawString(label, 6, textY)
+        }
+
+        g2.color = JBColor(Color(210, 210, 218), Color(96, 96, 108))
+        g2.drawLine(chartLeft, topPadding, chartLeft, height - bottomPadding)
+    }
+
+    private fun calculateAxisStep(maxValue: Long): Long {
+        val targetStep = (maxValue.toDouble() / yAxisTickCount).coerceAtLeast(1.0)
+        val stepCandidates = longArrayOf(
+            5L * 60_000L,
+            10L * 60_000L,
+            15L * 60_000L,
+            30L * 60_000L,
+            60L * 60_000L,
+            2L * 60L * 60_000L,
+            3L * 60L * 60_000L,
+            4L * 60L * 60_000L,
+            6L * 60L * 60_000L,
+            8L * 60L * 60_000L,
+            12L * 60L * 60_000L
+        )
+        return stepCandidates.firstOrNull { it >= targetStep } ?: stepCandidates.last()
+    }
+
+    private fun formatAxisDuration(millis: Long): String {
+        val totalMinutes = millis / 60_000L
+        val hours = totalMinutes / 60
+        val minutes = totalMinutes % 60
+
+        return when {
+            hours == 0L -> "${minutes}m"
+            minutes == 0L -> "${hours}h"
+            else -> "${hours}h ${minutes}m"
         }
     }
 
